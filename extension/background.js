@@ -48,7 +48,7 @@ async function handleMessage(message) {
     let result;
     if (message.action === "listTabs") result = await tabList();
     if (message.action === "createTab") {
-      const tab = await chrome.tabs.create({ url: message.url, active: false });
+      const tab = await createAgentTab(message.url);
       await shareTab(tab.id);
       result = tab;
     }
@@ -102,9 +102,30 @@ async function restoreSharedTabs() {
   await chrome.storage.session.set({ sharedTabIds: [...sharedTabs] });
 }
 
+// Agent-created tabs live in their own window so they never crowd the user's.
+async function createAgentTab(url) {
+  const { agentWindowId } = await chrome.storage.session.get("agentWindowId");
+  if (agentWindowId !== undefined) {
+    try {
+      await chrome.windows.get(agentWindowId);
+      return await chrome.tabs.create({ windowId: agentWindowId, url, active: false });
+    } catch {
+      // Agent window was closed; create a fresh one below.
+    }
+  }
+  const window = await chrome.windows.create({ url, focused: false });
+  await chrome.storage.session.set({ agentWindowId: window.id });
+  return window.tabs[0];
+}
+
 async function ensureAgentGroup(tabId) {
-  const groups = await chrome.tabGroups.query({ title: "Agent Bridge" });
-  const groupId = await chrome.tabs.group({ tabIds: [tabId], groupId: groups[0]?.id });
+  // Tab groups are per-window: reuse the Agent Bridge group in this tab's own
+  // window so grouping never drags a tab across windows.
+  const tab = await chrome.tabs.get(tabId);
+  const groups = await chrome.tabGroups.query({ title: "Agent Bridge", windowId: tab.windowId });
+  const groupId = groups[0]
+    ? await chrome.tabs.group({ tabIds: [tabId], groupId: groups[0].id })
+    : await chrome.tabs.group({ tabIds: [tabId], createProperties: { windowId: tab.windowId } });
   await chrome.tabGroups.update(groupId, { title: "Agent Bridge", color: "cyan", collapsed: false });
 }
 
