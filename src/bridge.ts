@@ -86,6 +86,10 @@ export class BrowserBridge {
         return;
       }
 
+      if (message.type === "ping") {
+        ws.send(JSON.stringify({ type: "pong" }));
+        return;
+      }
       if (message.type === "tabs") this.tabs = message.tabs;
       if (message.type === "response") {
         const pending = this.pending.get(message.id);
@@ -102,6 +106,11 @@ export class BrowserBridge {
       if (this.extension === ws) {
         this.extension = undefined;
         this.tabs = [];
+        for (const [id, pending] of this.pending) {
+          clearTimeout(pending.timer);
+          this.pending.delete(id);
+          pending.reject(new Error("Chrome extension disconnected"));
+        }
       }
     });
   }

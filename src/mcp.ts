@@ -4,8 +4,33 @@ import { z } from "zod";
 import type { BrowserBridge } from "./bridge.js";
 import { requireConfirmation } from "./policy.js";
 
+const KEY_DESCRIPTORS: Record<string, { code: string; windowsVirtualKeyCode: number; text?: string }> = {
+  Enter: { code: "Enter", windowsVirtualKeyCode: 13, text: "\r" },
+  NumpadEnter: { code: "NumpadEnter", windowsVirtualKeyCode: 13, text: "\r" },
+  Tab: { code: "Tab", windowsVirtualKeyCode: 9 },
+  Escape: { code: "Escape", windowsVirtualKeyCode: 27 },
+  Backspace: { code: "Backspace", windowsVirtualKeyCode: 8 },
+  Delete: { code: "Delete", windowsVirtualKeyCode: 46 },
+  ArrowUp: { code: "ArrowUp", windowsVirtualKeyCode: 38 },
+  ArrowDown: { code: "ArrowDown", windowsVirtualKeyCode: 40 },
+  ArrowLeft: { code: "ArrowLeft", windowsVirtualKeyCode: 37 },
+  ArrowRight: { code: "ArrowRight", windowsVirtualKeyCode: 39 },
+  Home: { code: "Home", windowsVirtualKeyCode: 36 },
+  End: { code: "End", windowsVirtualKeyCode: 35 },
+  PageUp: { code: "PageUp", windowsVirtualKeyCode: 33 },
+  PageDown: { code: "PageDown", windowsVirtualKeyCode: 34 }
+};
+
+const httpUrl = z
+  .string()
+  .url()
+  .refine((value) => /^https?:$/.test(new URL(value).protocol), {
+    message: "Only http: and https: URLs are allowed"
+  });
+
 const selectorScript = String.raw`
 (() => {
+  document.querySelectorAll('[data-ubb-ref]').forEach((el) => el.removeAttribute('data-ubb-ref'));
   const visible = (el) => {
     const style = getComputedStyle(el);
     const rect = el.getBoundingClientRect();
@@ -59,15 +84,14 @@ export async function runMcpServer(bridge: BrowserBridge): Promise<void> {
 
   server.tool("browser_status", "Show extension connection and explicitly shared tabs.", {}, async () => text(bridge.status()));
 
-  server.tool("browser_tabs", "List only the Chrome tabs explicitly shared with agents.", {}, async () => {
-    await bridge.command({ action: "listTabs" });
-    return text(bridge.status().tabs);
-  });
+  server.tool("browser_tabs", "List only the Chrome tabs explicitly shared with agents.", {}, async () =>
+    text(await bridge.command({ action: "listTabs" }))
+  );
 
   server.tool(
     "browser_new_tab",
     "Open a new agent-owned tab and share it automatically.",
-    { url: z.string().url() },
+    { url: httpUrl },
     async ({ url }) => text(await bridge.command({ action: "createTab", url }))
   );
 
@@ -89,7 +113,7 @@ export async function runMcpServer(bridge: BrowserBridge): Promise<void> {
   server.tool(
     "browser_navigate",
     "Navigate a shared tab to a URL.",
-    { url: z.string().url(), tabId: z.number().int().optional() },
+    { url: httpUrl, tabId: z.number().int().optional() },
     async ({ url, tabId }) => text(await cdp(bridge, selectedTab(bridge, tabId), "Page.navigate", { url }))
   );
 
@@ -121,12 +145,21 @@ export async function runMcpServer(bridge: BrowserBridge): Promise<void> {
 
   server.tool(
     "browser_press",
-    "Press a keyboard key in a shared tab.",
-    { key: z.string().min(1).max(30), tabId: z.number().int().optional() },
-    async ({ key, tabId }) => {
+    "Press a keyboard key in a shared tab. Enter can submit forms, so it requires explicit user confirmation.",
+    {
+      key: z.string().min(1).max(30),
+      confirmed: z.boolean().default(false),
+      tabId: z.number().int().optional()
+    },
+    async ({ key, confirmed, tabId }) => {
+      if (/^(enter|numpadenter)$/i.test(key)) {
+        requireConfirmation(`press ${key} which may submit a form`, confirmed);
+      }
       const id = selectedTab(bridge, tabId);
-      await cdp(bridge, id, "Input.dispatchKeyEvent", { type: "keyDown", key });
-      await cdp(bridge, id, "Input.dispatchKeyEvent", { type: "keyUp", key });
+      const descriptor = KEY_DESCRIPTORS[key] ?? (key.length === 1 ? { text: key } : {});
+      const params = { key, ...descriptor };
+      await cdp(bridge, id, "Input.dispatchKeyEvent", { type: params.text ? "keyDown" : "rawKeyDown", ...params });
+      await cdp(bridge, id, "Input.dispatchKeyEvent", { type: "keyUp", ...params });
       return text({ pressed: key });
     }
   );

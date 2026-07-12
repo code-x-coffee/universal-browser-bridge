@@ -1,9 +1,13 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 
 export function tokenPath(): string {
-  return resolve(process.env.UBB_TOKEN_FILE ?? ".data/token");
+  // A fixed default keeps pairing stable: MCP hosts launch this server from
+  // arbitrary working directories.
+  if (process.env.UBB_TOKEN_FILE) return resolve(process.env.UBB_TOKEN_FILE);
+  return join(homedir(), ".universal-browser-bridge", "token");
 }
 
 export async function getOrCreateToken(): Promise<string> {

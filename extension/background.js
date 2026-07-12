@@ -3,6 +3,7 @@ const DEFAULT_URL = "ws://127.0.0.1:17321/extension";
 const sharedTabs = new Set();
 let socket;
 let reconnectTimer;
+let keepaliveTimer;
 let intentionalDetach = new Set();
 
 async function settings() {
@@ -20,9 +21,14 @@ async function connect() {
   socket = new WebSocket(relayUrl);
   socket.addEventListener("open", () => {
     socket.send(JSON.stringify({ type: "hello", token, version: PROTOCOL_VERSION }));
+    // Regular WebSocket traffic keeps the MV3 service worker alive (Chrome 116+
+    // resets the 30s idle timer on each message).
+    clearInterval(keepaliveTimer);
+    keepaliveTimer = setInterval(() => send({ type: "ping" }), 20_000);
   });
   socket.addEventListener("message", (event) => void handleMessage(JSON.parse(event.data)));
   socket.addEventListener("close", () => {
+    clearInterval(keepaliveTimer);
     setGlobalBadge("!", "#b91c1c");
     reconnectTimer = setTimeout(connect, 2000);
   });
@@ -30,6 +36,7 @@ async function connect() {
 }
 
 async function handleMessage(message) {
+  if (message.type === "pong") return;
   if (message.type === "ready") {
     setGlobalBadge("", "#0891b2");
     await restoreSharedTabs();
@@ -131,8 +138,15 @@ function setGlobalBadge(text, color) {
 
 chrome.action.onClicked.addListener(async (tab) => {
   if (!tab.id || tab.url?.startsWith("chrome://") || tab.url?.startsWith("chrome-extension://")) return;
-  if (sharedTabs.has(tab.id)) await unshareTab(tab.id);
-  else await shareTab(tab.id);
+  try {
+    if (sharedTabs.has(tab.id)) await unshareTab(tab.id);
+    else await shareTab(tab.id);
+  } catch (error) {
+    // Attach can fail when DevTools is open on the tab or the page is policy-blocked.
+    console.error("Failed to toggle tab sharing", error);
+    await chrome.action.setBadgeText({ tabId: tab.id, text: "ERR" });
+    await chrome.action.setBadgeBackgroundColor({ tabId: tab.id, color: "#b91c1c" });
+  }
 });
 
 chrome.debugger.onDetach.addListener(({ tabId }) => {

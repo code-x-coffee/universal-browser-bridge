@@ -22,7 +22,7 @@ npm run build
 npm run token
 ```
 
-Copy the printed token. Then:
+Copy the printed token (stored at `~/.universal-browser-bridge/token` by default; override with `UBB_TOKEN_FILE`). Then:
 
 1. Open `chrome://extensions`.
 2. Enable **Developer mode**.
@@ -48,12 +48,9 @@ Example MCP configuration:
     "browser-bridge": {
       "command": "node",
       "args": [
-        "/Volumes/NVme/StandAlones/chrome-extensions/universal-browser-bridge/dist/cli.js",
+        "/absolute/path/to/universal-browser-bridge/dist/cli.js",
         "mcp"
-      ],
-      "env": {
-        "UBB_TOKEN_FILE": "/Volumes/NVme/StandAlones/chrome-extensions/universal-browser-bridge/.data/token"
-      }
+      ]
     }
   }
 }
@@ -78,9 +75,13 @@ Chrome internal pages, extension pages, password-manager prompts, passkeys, nati
 - The token is generated with 256 bits of randomness and stored with user-only file permissions.
 - Only explicitly shared tabs are attached with `chrome.debugger`.
 - The agent cannot read password values through `browser_snapshot`.
-- Potentially consequential click descriptions require `confirmed=true`.
+- Navigation and new tabs are restricted to `http:` and `https:` URLs, so the agent cannot point a shared tab at `file://` paths.
+- Potentially consequential click descriptions require `confirmed=true`, and pressing Enter (which can submit forms) requires confirmation as well.
 
-The confirmation gate is intentionally conservative but not sufficient for unsupervised financial, account-administration, or production workflows. Web content can contain prompt injection. Do not share sensitive tabs.
+Known limitations:
+
+- The pairing token is sent by the extension to whatever process is listening on `127.0.0.1:17321`. Another local process that binds the port first could capture the token. Loopback binding keeps this local-only, but on a shared or compromised machine treat the token as exposed and rotate it by deleting the token file.
+- The confirmation gate is intentionally conservative but not sufficient for unsupervised financial, account-administration, or production workflows. Web content can contain prompt injection. Do not share sensitive tabs.
 
 ## Development
 

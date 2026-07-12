@@ -11,7 +11,8 @@ export type ExtensionMessage =
   | { type: "hello"; token: string; version: number }
   | { type: "tabs"; tabs: SharedTab[] }
   | { type: "response"; id: string; result?: unknown; error?: string }
-  | { type: "event"; tabId: number; method: string; params: unknown };
+  | { type: "event"; tabId: number; method: string; params: unknown }
+  | { type: "ping" };
 
 export type BridgeCommand = {
   type: "command";
