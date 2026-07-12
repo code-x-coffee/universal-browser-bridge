@@ -32,12 +32,24 @@ Copy the printed token (stored at `~/.universal-browser-bridge/token` by default
 
 The toolbar badge clears when the MCP relay is running and paired.
 
+## Standalone binary (no Node required)
+
+With [Bun](https://bun.sh) installed, compile the CLI and its dependencies into one self-contained executable:
+
+```bash
+npm run binary   # produces bin/universal-browser-bridge (~60 MB)
+```
+
+The binary embeds the runtime, so end users need neither Node nor `npm install`. Cross-compile for other platforms with `bun build --compile --target=bun-linux-x64` (or `bun-windows-x64`, `bun-darwin-x64`, `bun-darwin-arm64`).
+
 ## Connect an MCP client
 
 Configure the client to run:
 
 ```bash
 node /absolute/path/to/universal-browser-bridge/dist/cli.js mcp
+# or, using the standalone binary:
+/absolute/path/to/universal-browser-bridge/bin/universal-browser-bridge mcp
 ```
 
 Example MCP configuration:

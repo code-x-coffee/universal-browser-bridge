@@ -17,7 +17,9 @@
     "token": "tsx src/cli.ts token",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "e2e": "npm run build && node scripts/e2e.mjs"
+    "e2e": "npm run build && node scripts/e2e.mjs",
+    "binary": "bun build --compile src/cli.ts --outfile bin/universal-browser-bridge",
+    "e2e:binary": "npm run binary && E2E_BINARY=\"$PWD/bin/universal-browser-bridge\" node scripts/e2e.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.3",

@@ -23,9 +23,11 @@ const record = (name, ok, detail = "") => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}${detail ? ` — ${detail}` : ""}`);
 };
 
+// Set E2E_BINARY=/path/to/compiled-binary to smoke-test the bun-compiled
+// executable instead of the Node build.
 const transport = new StdioClientTransport({
-  command: "node",
-  args: ["dist/cli.js", "mcp"],
+  command: process.env.E2E_BINARY ?? "node",
+  args: process.env.E2E_BINARY ? ["mcp"] : ["dist/cli.js", "mcp"],
   cwd: PROJECT,
   stderr: "inherit"
 });
