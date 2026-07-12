@@ -91,6 +91,8 @@ npm test
 npm run build
 ```
 
+With the extension loaded and paired, `npm run e2e` runs a live end-to-end smoke test through Chrome: it exercises every MCP tool, the confirmation gates, the `file://` rejection, stale-ref handling, and waits 45 seconds to verify the service-worker keepalive.
+
 The extension is plain JavaScript, so no browser build step is required. Reload it in `chrome://extensions` after extension changes.
 
 ## Next steps
