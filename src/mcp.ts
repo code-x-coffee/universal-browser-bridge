@@ -75,6 +75,22 @@ async function cdp(
   return bridge.command({ action: "cdp", tabId, method, params });
 }
 
+// Runtime.evaluate reports page-script throws via exceptionDetails instead of
+// failing the CDP call, so surface those as real errors and unwrap the value.
+async function evaluate(bridge: BrowserBridge, tabId: number, expression: string): Promise<unknown> {
+  const result = await cdp(bridge, tabId, "Runtime.evaluate", {
+    expression,
+    returnByValue: true,
+    awaitPromise: true
+  });
+  if (result?.exceptionDetails) {
+    throw new Error(
+      result.exceptionDetails.exception?.description ?? result.exceptionDetails.text ?? "Page script failed"
+    );
+  }
+  return result?.result?.value;
+}
+
 function text(value: unknown) {
   return { content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] };
 }
@@ -101,12 +117,7 @@ export async function runMcpServer(bridge: BrowserBridge): Promise<void> {
     { tabId: z.number().int().optional() },
     async ({ tabId }) => {
       const id = selectedTab(bridge, tabId);
-      const result = await cdp(bridge, id, "Runtime.evaluate", {
-        expression: selectorScript,
-        returnByValue: true,
-        awaitPromise: true
-      });
-      return text(result?.result?.value ?? result);
+      return text(await evaluate(bridge, id, selectorScript));
     }
   );
 
@@ -129,7 +140,7 @@ export async function runMcpServer(bridge: BrowserBridge): Promise<void> {
     async ({ ref, description, confirmed, tabId }) => {
       requireConfirmation(description, confirmed);
       const expression = `(() => { const el = document.querySelector('[data-ubb-ref="${ref}"]'); if (!el) throw new Error('Element ref expired; take a new snapshot'); el.click(); return true; })()`;
-      return text(await cdp(bridge, selectedTab(bridge, tabId), "Runtime.evaluate", { expression, returnByValue: true }));
+      return text(await evaluate(bridge, selectedTab(bridge, tabId), expression));
     }
   );
 
@@ -139,7 +150,7 @@ export async function runMcpServer(bridge: BrowserBridge): Promise<void> {
     { ref: z.string().regex(/^ubb-\d+$/), text: z.string(), tabId: z.number().int().optional() },
     async ({ ref, text: input, tabId }) => {
       const expression = `(() => { const el = document.querySelector('[data-ubb-ref="${ref}"]'); if (!el) throw new Error('Element ref expired; take a new snapshot'); el.focus(); if ('value' in el) { const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value')?.set; setter ? setter.call(el, ${JSON.stringify(input)}) : el.value = ${JSON.stringify(input)}; } else { el.textContent = ${JSON.stringify(input)}; } el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); return true; })()`;
-      return text(await cdp(bridge, selectedTab(bridge, tabId), "Runtime.evaluate", { expression, returnByValue: true }));
+      return text(await evaluate(bridge, selectedTab(bridge, tabId), expression));
     }
   );
 
@@ -170,7 +181,7 @@ export async function runMcpServer(bridge: BrowserBridge): Promise<void> {
     { deltaY: z.number().int().min(-10000).max(10000), tabId: z.number().int().optional() },
     async ({ deltaY, tabId }) => {
       const expression = `window.scrollBy({top:${deltaY},behavior:'instant'}); ({x:scrollX,y:scrollY})`;
-      return text(await cdp(bridge, selectedTab(bridge, tabId), "Runtime.evaluate", { expression, returnByValue: true }));
+      return text(await evaluate(bridge, selectedTab(bridge, tabId), expression));
     }
   );
 
