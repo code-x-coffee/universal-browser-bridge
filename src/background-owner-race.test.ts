@@ -139,11 +139,63 @@ it("still revokes sharing when a human later renames the tab's group away from A
   expect(statusBefore.tabs.some((tab) => tab.id === created.id)).toBe(true);
 
   // A human renames the group via the real Chrome UI -- a genuine departure
-  // from "Agent Bridge", not the extension's own transient setup state.
+  // from "Agent Bridge", not the extension's own transient setup state. The
+  // revocation guard debounces before re-checking live state (see
+  // scheduleRevocationCheck in background.js), so allow for that window.
   const tab = await chrome.tabs.get(created.id);
   simulateGroupRename(tab.groupId, "Renamed by a human");
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  await new Promise((resolve) => setTimeout(resolve, 350));
 
   const statusAfter = await owner.status();
   expect(statusAfter.tabs.some((t) => t.id === created.id)).toBe(false);
+});
+
+it("does not self-unshare when the group-creation event is delivered after ensureAgentGroup already finished", async () => {
+  // This is the ordering the groupingInProgress-only fix missed: real Chrome
+  // can deliver tabs.onUpdated/tabGroups.onUpdated for the group's creation
+  // (with its still-default title) well *after* chrome.tabGroups.update()
+  // already resolved and ensureAgentGroup's `finally` cleared
+  // groupingInProgress -- unlike the near-instant microtask dispatch the
+  // other tests here use. groupCreationEventDelay (200ms) exceeds
+  // tabGroupsUpdate (5ms) + badge (1ms) + the debugger-detach/status settle
+  // time, so by the time the event arrives, our own setup is long done and
+  // the "actively grouping" guard offers no protection.
+  const { chrome } = createChromeMock({
+    delays: { tabsGet: 1, tabGroupsGet: 1, tabGroupsUpdate: 5, debuggerDetach: 5, badge: 1, groupCreationEventDelay: 200 }
+  });
+  (globalThis as any).chrome = chrome;
+  (globalThis as any).WebSocket = TestWebSocket;
+
+  const win = await chrome.windows.create({ url: "about:blank", focused: false });
+  await chrome.storage.session.set({ agentWindowId: win.id });
+
+  bridge = new BrowserBridge(TOKEN, "127.0.0.1", 0);
+  await bridge.start();
+
+  const socketPath = join(tempDir, "daemon.sock");
+  daemon = new DaemonServer(bridge, TOKEN, socketPath);
+  await daemon.start();
+
+  await chrome.storage.local.set({ relayUrl: `ws://127.0.0.1:${bridge.port}/extension`, token: TOKEN });
+  // @ts-expect-error background.js is a plain untyped extension script with no declaration file; imported only for its side effects.
+  await import("../extension/background.js");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  const owner = new DaemonClient({ socketPath, token: TOKEN, clientId: randomUUID(), label: "owner" });
+  clients.push(owner);
+  await owner.connect();
+
+  const created = (await owner.request({ action: "createTab", url: "https://example.com" })) as { id: number };
+
+  // ensureAgentGroup (and the createTab response) settle well before the
+  // 200ms-delayed creation events are delivered.
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  const statusMidway = await owner.status();
+  expect(statusMidway.tabs.some((tab) => tab.id === created.id)).toBe(true);
+
+  // Now let the delayed creation events actually arrive.
+  await new Promise((resolve) => setTimeout(resolve, 250));
+
+  const statusAfter = await owner.status();
+  expect(statusAfter.tabs.some((tab) => tab.id === created.id)).toBe(true);
 });

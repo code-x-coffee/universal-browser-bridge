@@ -10,6 +10,17 @@ let reconnectTimer;
 let keepaliveTimer;
 let intentionalDetach = new Set();
 const groupingInProgress = new Set();
+const revocationChecks = new Map();
+// Debounce window before acting on a possible group departure. Chrome
+// dispatches tabs.onUpdated/tabGroups.onUpdated over a channel that isn't
+// strictly ordered against the extension's own API-call promises, and event
+// payloads can reflect state from the moment of the underlying change, not
+// whatever is live by delivery time. Never decide from an event's payload:
+// every check below re-reads live state via isInAgentGroup() right before
+// acting, so this delay only exists to let Chrome's own dispatch settle down
+// and coalesce repeat events -- the final decision is always the fresh
+// re-check, not the timer.
+const REVOCATION_DEBOUNCE_MS = 250;
 
 async function settings() {
   return chrome.storage.local.get({ relayUrl: DEFAULT_URL, token: "" });
@@ -181,6 +192,27 @@ async function isInAgentGroup(tabId) {
   }
 }
 
+// Coalesces possible-departure signals for a tab and, after a short settle
+// window, decides purely from a fresh live lookup -- never from whatever an
+// event's payload said. This is what makes the guard robust regardless of
+// how event delivery is timed relative to our own API calls: a stale event
+// arriving after we've already finished (re)grouping a tab resolves to "no
+// action" because the fresh check sees the tab correctly grouped, while a
+// genuine departure still resolves to "unshare" because the fresh check
+// confirms it's actually gone.
+function scheduleRevocationCheck(tabId) {
+  if (revocationChecks.has(tabId)) return;
+  const timer = setTimeout(async () => {
+    revocationChecks.delete(tabId);
+    if (!sharedTabs.has(tabId) || groupingInProgress.has(tabId)) return;
+    const inside = await isInAgentGroup(tabId);
+    if (!inside && sharedTabs.has(tabId) && !groupingInProgress.has(tabId)) {
+      await unshareTab(tabId, { ungroup: false });
+    }
+  }, REVOCATION_DEBOUNCE_MS);
+  revocationChecks.set(tabId, timer);
+}
+
 async function persistAgentTabs() {
   await chrome.storage.session.set({ agentTabIds: [...agentTabs] });
 }
@@ -285,16 +317,18 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (!sharedTabs.has(tabId) || changeInfo.groupId === undefined || groupingInProgress.has(tabId)) return;
-  void isInAgentGroup(tabId).then((inside) => {
-    if (!inside && sharedTabs.has(tabId) && !groupingInProgress.has(tabId)) void unshareTab(tabId, { ungroup: false });
-  });
+  scheduleRevocationCheck(tabId);
 });
 
+// Deliberately ignores `group.title` on the event itself -- see
+// scheduleRevocationCheck's comment. An event payload can carry the group's
+// state from the moment it was created (still untitled), even when it's
+// delivered well after our own chrome.tabGroups.update() already landed the
+// real title, so acting on it directly reintroduces the same race.
 chrome.tabGroups.onUpdated.addListener((group) => {
-  if (group.title === AGENT_GROUP_TITLE) return;
   void chrome.tabs.query({ groupId: group.id }).then((tabs) => {
     for (const tab of tabs) {
-      if (tab.id && sharedTabs.has(tab.id) && !groupingInProgress.has(tab.id)) void unshareTab(tab.id, { ungroup: false });
+      if (tab.id && sharedTabs.has(tab.id) && !groupingInProgress.has(tab.id)) scheduleRevocationCheck(tab.id);
     }
   });
 });

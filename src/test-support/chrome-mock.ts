@@ -12,6 +12,13 @@ export type ChromeMockDelays = Partial<{
   debuggerAttach: number;
   debuggerDetach: number;
   badge: number;
+  // How long after chrome.tabs.group()'s own promise resolves before the
+  // resulting tabs.onUpdated/tabGroups.onUpdated (creation) events are
+  // actually delivered to listeners. Real Chrome dispatches extension events
+  // over a separate channel from the API call's own promise, so delivery can
+  // land well after the call -- and any subsequent chrome.tabGroups.update()
+  // -- has already resolved. Defaults to 0 (same-tick delivery, as before).
+  groupCreationEventDelay: number;
 }>;
 
 function wait(ms: number): Promise<void> {
@@ -134,11 +141,23 @@ export function createChromeMock(options: { delays?: ChromeMockDelays } = {}) {
         }
         await wait(d("tabsGroup", 0));
         tab.groupId = gid;
-        // Real Chrome dispatches tabs.onUpdated over its own event channel,
-        // not strictly ordered after this call's own promise settles.
-        queueMicrotask(() => {
-          for (const fn of tabsOnUpdated) fn(tabId, { groupId: gid }, { ...tab });
-        });
+        // Real Chrome dispatches tabs.onUpdated/tabGroups.onUpdated over
+        // their own event channel, not strictly ordered after this call's
+        // own promise settles -- and the event payload reflects state at
+        // the moment of the underlying change (here: the group's still-
+        // default title), not whatever is live by the time it's delivered.
+        const isNewGroup = groupId === undefined;
+        const tabSnapshot = { ...tab };
+        const groupSnapshot = { ...groupsById.get(gid)! };
+        const eventDelay = d("groupCreationEventDelay", 0);
+        setTimeout(() => {
+          for (const fn of tabsOnUpdated) fn(tabId, { groupId: gid }, tabSnapshot);
+        }, eventDelay);
+        if (isNewGroup) {
+          setTimeout(() => {
+            for (const fn of tabGroupsOnUpdated) fn(groupSnapshot);
+          }, eventDelay);
+        }
         return gid;
       },
       ungroup: async (tabId: number) => {
