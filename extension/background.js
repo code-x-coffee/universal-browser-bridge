@@ -9,6 +9,7 @@ let socket;
 let reconnectTimer;
 let keepaliveTimer;
 let intentionalDetach = new Set();
+const groupingInProgress = new Set();
 
 async function settings() {
   return chrome.storage.local.get({ relayUrl: DEFAULT_URL, token: "" });
@@ -148,12 +149,25 @@ async function createAgentTab(url) {
 async function ensureAgentGroup(tabId) {
   // Tab groups are per-window: reuse the Agent Bridge group in this tab's own
   // window so grouping never drags a tab across windows.
-  const tab = await chrome.tabs.get(tabId);
-  const groups = await chrome.tabGroups.query({ title: AGENT_GROUP_TITLE, windowId: tab.windowId });
-  const groupId = groups[0]
-    ? await chrome.tabs.group({ tabIds: [tabId], groupId: groups[0].id })
-    : await chrome.tabs.group({ tabIds: [tabId], createProperties: { windowId: tab.windowId } });
-  await chrome.tabGroups.update(groupId, { title: AGENT_GROUP_TITLE, color: "cyan", collapsed: false });
+  //
+  // chrome.tabs.group() and the chrome.tabGroups.update() that titles the
+  // group are two separate round trips. chrome.tabs.onUpdated (and
+  // chrome.tabGroups.onUpdated) can fire and be fully handled in between,
+  // so a listener reacting to *this* grouping can observe the group before
+  // its title is set. Track tabs we're actively (re)grouping so those
+  // listeners can tell "still being grouped by us" apart from "left the
+  // group" and not misfire an unshare on a tab we just shared.
+  groupingInProgress.add(tabId);
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    const groups = await chrome.tabGroups.query({ title: AGENT_GROUP_TITLE, windowId: tab.windowId });
+    const groupId = groups[0]
+      ? await chrome.tabs.group({ tabIds: [tabId], groupId: groups[0].id })
+      : await chrome.tabs.group({ tabIds: [tabId], createProperties: { windowId: tab.windowId } });
+    await chrome.tabGroups.update(groupId, { title: AGENT_GROUP_TITLE, color: "cyan", collapsed: false });
+  } finally {
+    groupingInProgress.delete(tabId);
+  }
 }
 
 async function isInAgentGroup(tabId) {
@@ -270,9 +284,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (!sharedTabs.has(tabId) || changeInfo.groupId === undefined) return;
+  if (!sharedTabs.has(tabId) || changeInfo.groupId === undefined || groupingInProgress.has(tabId)) return;
   void isInAgentGroup(tabId).then((inside) => {
-    if (!inside && sharedTabs.has(tabId)) void unshareTab(tabId, { ungroup: false });
+    if (!inside && sharedTabs.has(tabId) && !groupingInProgress.has(tabId)) void unshareTab(tabId, { ungroup: false });
   });
 });
 
@@ -280,7 +294,7 @@ chrome.tabGroups.onUpdated.addListener((group) => {
   if (group.title === AGENT_GROUP_TITLE) return;
   void chrome.tabs.query({ groupId: group.id }).then((tabs) => {
     for (const tab of tabs) {
-      if (tab.id && sharedTabs.has(tab.id)) void unshareTab(tab.id, { ungroup: false });
+      if (tab.id && sharedTabs.has(tab.id) && !groupingInProgress.has(tab.id)) void unshareTab(tab.id, { ungroup: false });
     }
   });
 });
