@@ -17,7 +17,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, expect, it } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { WebSocket as WSImpl } from "ws";
 import { BrowserBridge } from "./bridge.js";
 import { DaemonClient } from "./daemon-client.js";
@@ -39,6 +39,11 @@ const clients: DaemonClient[] = [];
 
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), "ubb-bgrace-test-"));
+  // extension/background.js runs module-level side effects (registers
+  // listeners, kicks off connect()) on import; each test needs its own fresh
+  // evaluation against its own chrome mock, not the previous test's cached
+  // module instance and stale listener registrations.
+  vi.resetModules();
 });
 
 afterEach(async () => {
@@ -99,4 +104,46 @@ it("does not let another client close a tab that the extension's own group/title
   await new Promise((resolve) => setTimeout(resolve, 150));
 
   await expect(other.request({ action: "closeTab", tabId: created.id })).rejects.toThrow(/owning client|owner/i);
+});
+
+it("still revokes sharing when a human later renames the tab's group away from Agent Bridge", async () => {
+  const { chrome, simulateGroupRename } = createChromeMock({
+    delays: { tabsGet: 1, tabGroupsGet: 1, tabGroupsUpdate: 5, debuggerDetach: 5, badge: 1 }
+  });
+  (globalThis as any).chrome = chrome;
+  (globalThis as any).WebSocket = TestWebSocket;
+
+  const win = await chrome.windows.create({ url: "about:blank", focused: false });
+  await chrome.storage.session.set({ agentWindowId: win.id });
+
+  bridge = new BrowserBridge(TOKEN, "127.0.0.1", 0);
+  await bridge.start();
+
+  const socketPath = join(tempDir, "daemon.sock");
+  daemon = new DaemonServer(bridge, TOKEN, socketPath);
+  await daemon.start();
+
+  await chrome.storage.local.set({ relayUrl: `ws://127.0.0.1:${bridge.port}/extension`, token: TOKEN });
+  // @ts-expect-error background.js is a plain untyped extension script with no declaration file; imported only for its side effects.
+  await import("../extension/background.js");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  const owner = new DaemonClient({ socketPath, token: TOKEN, clientId: randomUUID(), label: "owner" });
+  clients.push(owner);
+  await owner.connect();
+
+  const created = (await owner.request({ action: "createTab", url: "https://example.com" })) as { id: number };
+  // Let the extension-initiated group/title race resolve; the tab must stay shared.
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const statusBefore = await owner.status();
+  expect(statusBefore.tabs.some((tab) => tab.id === created.id)).toBe(true);
+
+  // A human renames the group via the real Chrome UI -- a genuine departure
+  // from "Agent Bridge", not the extension's own transient setup state.
+  const tab = await chrome.tabs.get(created.id);
+  simulateGroupRename(tab.groupId, "Renamed by a human");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  const statusAfter = await owner.status();
+  expect(statusAfter.tabs.some((t) => t.id === created.id)).toBe(false);
 });

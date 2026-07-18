@@ -191,5 +191,16 @@ export function createChromeMock(options: { delays?: ChromeMockDelays } = {}) {
     }
   };
 
-  return { chrome };
+  // Simulates a human renaming the group via the real Chrome tab-strip UI:
+  // unlike chrome.tabGroups.update (which the extension itself calls), this
+  // mutates the group and fires tabGroups.onUpdated without going through
+  // the extension's own code, exactly like a Chrome-originated event would.
+  function simulateGroupRename(groupId: number, title: string): void {
+    const group = groupsById.get(groupId);
+    if (!group) throw new Error(`No group ${groupId}`);
+    group.title = title;
+    for (const fn of tabGroupsOnUpdated) fn({ ...group });
+  }
+
+  return { chrome, simulateGroupRename };
 }
