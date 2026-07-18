@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.data/
+coverage/
+.DS_Store
+*.log
+.e2e-screenshot.png
+bin/

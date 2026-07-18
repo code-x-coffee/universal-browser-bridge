@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Universal Agent Browser Bridge",
+  "version": "0.1.0",
+  "description": "Share selected Chrome tabs with locally paired AI agents.",
+  "permissions": ["debugger", "tabs", "tabGroups", "storage"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src ws://127.0.0.1:*"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Share or unshare this tab with agents"
+  },
+  "options_page": "options.html"
+}

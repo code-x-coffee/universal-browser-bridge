@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Universal Agent Browser Bridge</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">LOCAL BROWSER CONTROL</p>
+      <h1>Universal Agent Browser Bridge</h1>
+      <p class="lede">Only tabs marked <strong>ON</strong> are visible to paired agents. Click the toolbar icon on a tab to share or revoke it.</p>
+      <label>Relay URL<input id="relayUrl" type="url" value="ws://127.0.0.1:17321/extension" /></label>
+      <label>Pairing token<input id="token" type="password" autocomplete="off" placeholder="Run npm run token" /></label>
+      <div class="actions"><button id="save">Save and connect</button><span id="status"></span></div>
+      <section>
+        <h2>Safety boundary</h2>
+        <ul>
+          <li>The bridge listens only on your computer.</li>
+          <li>Agents see only tabs you explicitly share.</li>
+          <li>Remove a tab by clicking the toolbar icon again.</li>
+          <li>Do not share banking, password-manager, or payment tabs.</li>
+        </ul>
+      </section>
+    </main>
+    <script src="options.js"></script>
+  </body>
+</html>
