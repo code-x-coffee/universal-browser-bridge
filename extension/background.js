@@ -1,6 +1,10 @@
 const PROTOCOL_VERSION = 1;
 const DEFAULT_URL = "ws://127.0.0.1:17321/extension";
+const AGENT_GROUP_TITLE = "Agent Bridge";
 const sharedTabs = new Set();
+const agentTabs = new Set();
+const pendingApprovals = new Map();
+const approvalWindows = new Map();
 let socket;
 let reconnectTimer;
 let keepaliveTimer;
@@ -52,6 +56,17 @@ async function handleMessage(message) {
       await shareTab(tab.id);
       result = tab;
     }
+    if (message.action === "closeTab") {
+      if (!agentTabs.has(message.tabId)) throw new Error("Only agent-created tabs can be closed by agents");
+      await unshareTab(message.tabId, { ungroup: false });
+      await chrome.tabs.remove(message.tabId);
+      agentTabs.delete(message.tabId);
+      await persistAgentTabs();
+      result = { closed: message.tabId };
+    }
+    if (message.action === "requestApproval") {
+      result = { approved: await requestApproval(message.description || "Allow this browser action?") };
+    }
     if (message.action === "cdp") {
       if (!sharedTabs.has(message.tabId)) throw new Error("Tab is not shared");
       result = await chrome.debugger.sendCommand({ tabId: message.tabId }, message.method, message.params || {});
@@ -73,7 +88,7 @@ async function shareTab(tabId) {
   await sendTabs();
 }
 
-async function unshareTab(tabId) {
+async function unshareTab(tabId, { ungroup = true } = {}) {
   if (!sharedTabs.has(tabId)) return;
   sharedTabs.delete(tabId);
   intentionalDetach.add(tabId);
@@ -81,6 +96,7 @@ async function unshareTab(tabId) {
   intentionalDetach.delete(tabId);
   await chrome.storage.session.set({ sharedTabIds: [...sharedTabs] });
   await chrome.action.setBadgeText({ tabId, text: "" });
+  if (ungroup && await isInAgentGroup(tabId)) await chrome.tabs.ungroup(tabId).catch(() => {});
   await sendTabs();
 }
 
@@ -89,6 +105,7 @@ async function restoreSharedTabs() {
   for (const tabId of sharedTabIds) {
     try {
       await chrome.tabs.get(tabId);
+      if (!await isInAgentGroup(tabId)) throw new Error("Tab left the Agent Bridge group");
       await chrome.debugger.attach({ tabId }, "1.3").catch((error) => {
         if (!String(error).includes("already attached")) throw error;
       });
@@ -108,25 +125,91 @@ async function createAgentTab(url) {
   if (agentWindowId !== undefined) {
     try {
       await chrome.windows.get(agentWindowId);
-      return await chrome.tabs.create({ windowId: agentWindowId, url, active: false });
+      const tab = await chrome.tabs.create({ windowId: agentWindowId, url, active: false });
+      agentTabs.add(tab.id);
+      await persistAgentTabs();
+      return tab;
     } catch {
       // Agent window was closed; create a fresh one below.
     }
   }
+  const approved = await requestApproval(
+    `Create an agent-controlled Chrome window? Tabs opened there can use your signed-in Chrome session. First URL: ${url}`
+  );
+  if (!approved) throw new Error("User denied creation of the agent-controlled window");
   const window = await chrome.windows.create({ url, focused: false });
   await chrome.storage.session.set({ agentWindowId: window.id });
-  return window.tabs[0];
+  const tab = window.tabs[0];
+  agentTabs.add(tab.id);
+  await persistAgentTabs();
+  return tab;
 }
 
 async function ensureAgentGroup(tabId) {
   // Tab groups are per-window: reuse the Agent Bridge group in this tab's own
   // window so grouping never drags a tab across windows.
   const tab = await chrome.tabs.get(tabId);
-  const groups = await chrome.tabGroups.query({ title: "Agent Bridge", windowId: tab.windowId });
+  const groups = await chrome.tabGroups.query({ title: AGENT_GROUP_TITLE, windowId: tab.windowId });
   const groupId = groups[0]
     ? await chrome.tabs.group({ tabIds: [tabId], groupId: groups[0].id })
     : await chrome.tabs.group({ tabIds: [tabId], createProperties: { windowId: tab.windowId } });
-  await chrome.tabGroups.update(groupId, { title: "Agent Bridge", color: "cyan", collapsed: false });
+  await chrome.tabGroups.update(groupId, { title: AGENT_GROUP_TITLE, color: "cyan", collapsed: false });
+}
+
+async function isInAgentGroup(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.groupId === undefined || tab.groupId < 0) return false;
+    const group = await chrome.tabGroups.get(tab.groupId);
+    return group.title === AGENT_GROUP_TITLE;
+  } catch {
+    return false;
+  }
+}
+
+async function persistAgentTabs() {
+  await chrome.storage.session.set({ agentTabIds: [...agentTabs] });
+}
+
+async function restoreAgentTabs() {
+  const { agentTabIds = [] } = await chrome.storage.session.get({ agentTabIds: [] });
+  for (const tabId of agentTabIds) {
+    try {
+      await chrome.tabs.get(tabId);
+      agentTabs.add(tabId);
+    } catch {
+      agentTabs.delete(tabId);
+    }
+  }
+  await persistAgentTabs();
+}
+
+async function requestApproval(description) {
+  const id = crypto.randomUUID();
+  await chrome.storage.session.set({ [`approval_${id}`]: { description, createdAt: Date.now() } });
+  const window = await chrome.windows.create({
+    url: chrome.runtime.getURL(`approval.html?id=${encodeURIComponent(id)}`),
+    type: "popup",
+    width: 480,
+    height: 360,
+    focused: true
+  });
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => finishApproval(id, false), 120_000);
+    pendingApprovals.set(id, { resolve, timer, windowId: window.id });
+    approvalWindows.set(window.id, id);
+  });
+}
+
+function finishApproval(id, approved) {
+  const pending = pendingApprovals.get(id);
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  pendingApprovals.delete(id);
+  approvalWindows.delete(pending.windowId);
+  chrome.storage.session.remove(`approval_${id}`);
+  chrome.windows.remove(pending.windowId).catch(() => {});
+  pending.resolve(Boolean(approved));
 }
 
 async function tabList() {
@@ -180,12 +263,44 @@ chrome.debugger.onDetach.addListener(({ tabId }) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   sharedTabs.delete(tabId);
+  agentTabs.delete(tabId);
   chrome.storage.session.set({ sharedTabIds: [...sharedTabs] });
+  void persistAgentTabs();
   void sendTabs();
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (!sharedTabs.has(tabId) || changeInfo.groupId === undefined) return;
+  void isInAgentGroup(tabId).then((inside) => {
+    if (!inside && sharedTabs.has(tabId)) void unshareTab(tabId, { ungroup: false });
+  });
+});
+
+chrome.tabGroups.onUpdated.addListener((group) => {
+  if (group.title === AGENT_GROUP_TITLE) return;
+  void chrome.tabs.query({ groupId: group.id }).then((tabs) => {
+    for (const tab of tabs) {
+      if (tab.id && sharedTabs.has(tab.id)) void unshareTab(tab.id, { ungroup: false });
+    }
+  });
+});
+
+chrome.windows.onRemoved.addListener((windowId) => {
+  const approvalId = approvalWindows.get(windowId);
+  if (approvalId) finishApproval(approvalId, false);
+  void chrome.storage.session.get("agentWindowId").then(({ agentWindowId }) => {
+    if (agentWindowId === windowId) chrome.storage.session.remove("agentWindowId");
+  });
+});
+
+chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type === "approvalDecision" && typeof message.id === "string") {
+    finishApproval(message.id, message.approved === true);
+  }
 });
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && (changes.token || changes.relayUrl)) void connect();
 });
 
-void connect();
+void restoreAgentTabs().then(connect);

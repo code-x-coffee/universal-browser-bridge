@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Approve browser action</title>
+    <link rel="stylesheet" href="approval.css" />
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">AGENT REQUEST</p>
+      <h1>Allow this action?</h1>
+      <p id="description">Loading request…</p>
+      <div class="actions">
+        <button id="deny" class="secondary">Deny</button>
+        <button id="approve">Allow once</button>
+      </div>
+      <p class="note">Closing this window denies the request. Approval applies only to this exact action.</p>
+    </main>
+    <script src="approval.js"></script>
+  </body>
+</html>

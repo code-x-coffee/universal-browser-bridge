@@ -10,12 +10,18 @@ export class BrowserBridge {
   private extension?: WebSocket;
   private tabs: SharedTab[] = [];
   private pending = new Map<string, Pending>();
+  private server?: ReturnType<typeof createServer>;
+  private boundPort = 0;
 
   constructor(
     private readonly token: string,
     private readonly host = "127.0.0.1",
-    private readonly port = 17321
+    private readonly requestedPort = 17321
   ) {}
+
+  get port(): number {
+    return this.boundPort;
+  }
 
   async start(): Promise<void> {
     const server = createServer((req, res) => void this.handleHttp(req, res));
@@ -31,8 +37,21 @@ export class BrowserBridge {
 
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
-      server.listen(this.port, this.host, resolve);
+      server.listen(this.requestedPort, this.host, resolve);
     });
+    this.server = server;
+    const address = server.address();
+    this.boundPort = typeof address === "object" && address ? address.port : this.requestedPort;
+  }
+
+  async stop(): Promise<void> {
+    for (const [id, pending] of this.pending) {
+      clearTimeout(pending.timer);
+      this.pending.delete(id);
+      pending.reject(new Error("Bridge stopped"));
+    }
+    this.extension?.close();
+    await new Promise<void>((resolve) => (this.server ? this.server.close(() => resolve()) : resolve()));
   }
 
   status(): BridgeStatus {
@@ -46,10 +65,11 @@ export class BrowserBridge {
     const id = randomUUID();
     const payload: BridgeCommand = { type: "command", id, ...command };
     return new Promise((resolve, reject) => {
+      const timeoutMs = command.action === "requestApproval" || command.action === "createTab" ? 130_000 : 20_000;
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`Browser command timed out: ${command.action}`));
-      }, 20_000);
+      }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       this.extension?.send(JSON.stringify(payload));
     });
