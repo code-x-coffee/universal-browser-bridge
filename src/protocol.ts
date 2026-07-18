@@ -33,15 +33,19 @@ export type BridgeStatus = {
 
 // --- Daemon control protocol (MCP adapter <-> serve daemon, NDJSON over a
 // Unix domain socket / Windows named pipe) ---
+//
+// Deliberately excludes any standalone "requestApproval"/"clickDetails"
+// action: approval policy is a daemon-owned decision made atomically inside
+// the "click"/"press" handlers (element inspection, policy check, human
+// approval, and execution all happen under one held tab lease), not
+// something an MCP adapter can request or bypass on its own.
 
 export type ControlAction =
   | "status"
   | "listTabs"
   | "createTab"
   | "closeTab"
-  | "requestApproval"
   | "snapshot"
-  | "clickDetails"
   | "click"
   | "type"
   | "navigate"

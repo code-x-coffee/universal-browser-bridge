@@ -1,12 +1,16 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { WebSocketServer, WebSocket } from "ws";
 import { PROTOCOL_VERSION, type BridgeCommand, type BridgeStatus, type ExtensionMessage, type SharedTab } from "./protocol.js";
 import { tokensMatch } from "./auth.js";
 
 type Pending = { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout };
 
-export class BrowserBridge {
+// Emits "tabs" with the latest SharedTab[] whenever the extension reports an
+// updated list (including resetting to [] on disconnect), so the daemon can
+// reconcile ownership/lease state for tabs that vanish out-of-band.
+export class BrowserBridge extends EventEmitter {
   private extension?: WebSocket;
   private tabs: SharedTab[] = [];
   private pending = new Map<string, Pending>();
@@ -17,7 +21,9 @@ export class BrowserBridge {
     private readonly token: string,
     private readonly host = "127.0.0.1",
     private readonly requestedPort = 17321
-  ) {}
+  ) {
+    super();
+  }
 
   get port(): number {
     return this.boundPort;
@@ -110,7 +116,10 @@ export class BrowserBridge {
         ws.send(JSON.stringify({ type: "pong" }));
         return;
       }
-      if (message.type === "tabs") this.tabs = message.tabs;
+      if (message.type === "tabs") {
+        this.tabs = message.tabs;
+        this.emit("tabs", this.tabs);
+      }
       if (message.type === "response") {
         const pending = this.pending.get(message.id);
         if (!pending) return;
@@ -126,6 +135,7 @@ export class BrowserBridge {
       if (this.extension === ws) {
         this.extension = undefined;
         this.tabs = [];
+        this.emit("tabs", this.tabs);
         for (const [id, pending] of this.pending) {
           clearTimeout(pending.timer);
           this.pending.delete(id);

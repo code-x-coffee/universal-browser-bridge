@@ -27,6 +27,18 @@ if (command === "token") {
       `  Token:               ${tokenPath()}\n` +
       `Connect MCP adapters with \`universal-browser-bridge mcp\` (each adapter is a lightweight client of this daemon).\n`
   );
+
+  let shuttingDown = false;
+  const shutdown = async (signal: NodeJS.Signals) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    process.stderr.write(`\nReceived ${signal}; shutting down the daemon...\n`);
+    await daemon.stop();
+    await bridge.stop();
+    process.exit(0);
+  };
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
 } else if (command === "mcp") {
   const client = new DaemonClient({
     socketPath: daemonSocketPath(),

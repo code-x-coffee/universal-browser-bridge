@@ -5,6 +5,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -182,6 +183,24 @@ describe("CLI serve + mcp (real processes, no Chrome)", () => {
       expect(closeByA.isError).toBeFalsy();
     },
     20_000
+  );
+
+  it(
+    "shuts down gracefully on SIGTERM, cleaning up the control socket",
+    async () => {
+      await startServe();
+      const socketPath = env.UBB_SOCKET_PATH as string;
+      expect(existsSync(socketPath)).toBe(true);
+
+      const exited = new Promise<number>((resolve) => serveProcess!.once("exit", (code) => resolve(code ?? -1)));
+      serveProcess!.kill("SIGTERM");
+      const exitCode = await exited;
+      serveProcess = undefined;
+
+      expect(exitCode).toBe(0);
+      expect(existsSync(socketPath)).toBe(false);
+    },
+    10_000
   );
 
   it(

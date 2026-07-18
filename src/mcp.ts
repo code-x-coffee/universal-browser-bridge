@@ -2,7 +2,6 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import type { DaemonClient } from "./daemon-client.js";
-import { isPotentiallyConsequential } from "./policy.js";
 import { assertBrowserUrlAllowed } from "./url-policy.js";
 
 const httpUrl = z
@@ -17,11 +16,6 @@ async function selectedTab(bridge: DaemonClient, requested?: number): Promise<nu
   const tab = requested ? status.tabs.find((item) => item.id === requested) : status.tabs.find((item) => item.active) ?? status.tabs[0];
   if (!tab) throw new Error("No shared tab is available. Click the extension icon on a Chrome tab to share it.");
   return tab.id;
-}
-
-async function requireHumanApproval(bridge: DaemonClient, description: string): Promise<void> {
-  const result = (await bridge.request({ action: "requestApproval", description })) as { approved?: boolean };
-  if (!result?.approved) throw new Error(`User denied browser action: ${description}`);
 }
 
 function text(value: unknown) {
@@ -70,27 +64,15 @@ export async function runMcpServer(bridge: DaemonClient): Promise<void> {
 
   server.tool(
     "browser_click",
-    "Click an element from browser_snapshot. Requires the snapshotId from that snapshot; stale snapshots (e.g. after navigation) are rejected. Consequential actions require explicit user confirmation.",
+    "Click an element from browser_snapshot. Requires the snapshotId from that snapshot; stale snapshots (e.g. after navigation) are rejected. Consequential actions require explicit user confirmation; the daemon decides and enforces this, not the calling adapter.",
     {
       ref: z.string().regex(/^ubb-\d+$/),
       description: z.string().min(1),
       snapshotId: z.string().min(1),
       tabId: z.number().int().optional()
     },
-    async ({ ref, description, snapshotId, tabId }) => {
-      const id = await selectedTab(bridge, tabId);
-      const details = (await bridge.request({ action: "clickDetails", tabId: id, ref, snapshotId })) as {
-        text?: string;
-        type?: string;
-        href?: string;
-        formAction?: string;
-      };
-      const actionSummary = [description, details.text, details.type, details.href, details.formAction].filter(Boolean).join(" | ");
-      if (isPotentiallyConsequential(actionSummary)) {
-        await requireHumanApproval(bridge, `Allow click: ${actionSummary}`);
-      }
-      return text(await bridge.request({ action: "click", tabId: id, ref, snapshotId }));
-    }
+    async ({ ref, description, snapshotId, tabId }) =>
+      text(await bridge.request({ action: "click", tabId: await selectedTab(bridge, tabId), ref, description, snapshotId }))
   );
 
   server.tool(
@@ -103,18 +85,12 @@ export async function runMcpServer(bridge: DaemonClient): Promise<void> {
 
   server.tool(
     "browser_press",
-    "Press a keyboard key in a shared tab. Enter can submit forms, so it requires explicit user confirmation.",
+    "Press a keyboard key in a shared tab. Enter can submit forms, so it requires explicit user confirmation; the daemon decides and enforces this, not the calling adapter.",
     {
       key: z.string().min(1).max(30),
       tabId: z.number().int().optional()
     },
-    async ({ key, tabId }) => {
-      if (/^(enter|numpadenter)$/i.test(key)) {
-        await requireHumanApproval(bridge, `Allow ${key}? It may submit the current form.`);
-      }
-      const id = await selectedTab(bridge, tabId);
-      return text(await bridge.request({ action: "press", tabId: id, key }));
-    }
+    async ({ key, tabId }) => text(await bridge.request({ action: "press", tabId: await selectedTab(bridge, tabId), key }))
   );
 
   server.tool(
