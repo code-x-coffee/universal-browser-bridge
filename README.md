@@ -1,73 +1,135 @@
 # Universal Agent Browser Bridge
 
-A local, agent-agnostic bridge that lets MCP-compatible agents operate only the Chrome tabs you explicitly share.
+A local, agent-agnostic bridge that lets MCP-compatible AI agents operate only the Chrome tabs you explicitly share.
 
-This is an independent implementation inspired by the visible tab-consent model used by OpenClaw. It is not affiliated with OpenClaw, Anthropic, Google, or OpenAI.
+It works with Hermes, Claude Code, Codex, and other MCP clients while keeping your signed-in Chrome session, tab access, and consequential-action approvals under your control.
 
-## Current MVP
+> This is an independent project inspired by visible tab-consent browser-control systems. It is not affiliated with OpenClaw, Anthropic, Google, OpenAI, or Nous Research.
 
-- Unpacked Chrome MV3 extension using `chrome.debugger`
-- Explicit per-tab sharing through a visible **Agent Bridge** tab group
-- Authenticated WebSocket connection bound to `127.0.0.1`
-- A single long-running `serve` daemon owns the extension connection; any number of `mcp` adapters (Claude Code, Codex, Hermes, etc.) connect to it at once over an authenticated local control socket
-- MCP tools for tabs, navigation, snapshots, clicking, typing, keys, scrolling, and screenshots
-- Temporary DOM refs rather than arbitrary selectors supplied by the model, gated by a `snapshotId` that goes stale on navigation
-- Chrome-hosted human approval for purchases, sends, deletes, submissions, Enter presses, and agent-window creation, and approval prompts name which adapter asked
-- Agent-created tabs are owned by the adapter that created them; only that adapter can close them
+## What it provides
 
-## Install
+- A Chrome Manifest V3 extension using `chrome.debugger`
+- Explicit per-tab access through a visible **Agent Bridge** tab group and **ON** badge
+- One local `serve` daemon that owns the Chrome connection
+- Multiple simultaneous MCP clients connected through authenticated local IPC
+- Navigation, snapshots, clicking, typing, key presses, scrolling, screenshots, and tab management
+- Generation-scoped DOM references that become invalid after navigation
+- Chrome-hosted human approval for consequential actions
+- Per-client ownership of agent-created tabs
+- Per-tab serialization so multiple agents cannot interleave browser actions
+
+## Architecture
+
+```text
+Chrome extension
+      |
+      | authenticated WebSocket on 127.0.0.1:17321
+      v
+Universal Browser Bridge daemon (`serve`)
+      |
+      | authenticated Unix socket / Windows named pipe
+      +---- MCP adapter (`mcp`) for Hermes
+      +---- MCP adapter (`mcp`) for Claude Code
+      +---- MCP adapter (`mcp`) for Codex
+      +---- MCP adapter (`mcp`) for another session or agent
+```
+
+The Chrome extension maintains one connection to the daemon. Start the daemon once, then connect as many MCP adapter processes as you need.
+
+## Quick start
+
+### 1. Clone and build
+
+Requirements:
+
+- Google Chrome or a compatible Chromium browser with Manifest V3 and `chrome.debugger`
+- Node.js and npm (the project is verified with Node.js 22)
+- An MCP-compatible agent or client
 
 ```bash
-npm install
+git clone git@github.com:code-x-coffee/universal-browser-bridge.git
+cd universal-browser-bridge
+npm ci
 npm run build
+```
+
+If you cloned over HTTPS instead:
+
+```bash
+git clone https://github.com/code-x-coffee/universal-browser-bridge.git
+```
+
+### 2. Generate the pairing token
+
+```bash
 npm run token
 ```
 
-Copy the printed token (stored at `~/.universal-browser-bridge/token` by default; override with `UBB_TOKEN_FILE`). Then:
+Copy the printed token. It is stored at:
+
+```text
+~/.universal-browser-bridge/token
+```
+
+Keep it private. The extension and every local MCP adapter use it to authenticate with the daemon.
+
+### 3. Load the Chrome extension
 
 1. Open `chrome://extensions`.
 2. Enable **Developer mode**.
 3. Click **Load unpacked**.
-4. Select this project's `extension/` directory.
-5. Open the extension options and paste the pairing token.
+4. Select the repository's `extension/` directory.
+5. Open the extension's **Details** page.
+6. Click **Extension options**.
+7. Set **Relay URL** to:
 
-The toolbar badge clears when the `serve` daemon is running and paired. The first agent-created window opens a one-time Chrome approval prompt for that window's session.
+   ```text
+   ws://127.0.0.1:17321/extension
+   ```
 
-## Standalone binary (no Node required)
+8. Paste the pairing token.
+9. Click **Save and connect**.
 
-With [Bun](https://bun.sh) installed, compile the CLI and its dependencies into one self-contained executable:
+The extension can be configured before the daemon starts. Its toolbar badge clears once the daemon is running and authentication succeeds.
+
+> Loading the extension from a different directory creates a different unpacked-extension identity in Chrome. You must enter the relay URL and token again for that new identity.
+
+### 4. Start the daemon
+
+Run this in a dedicated terminal and leave it running:
 
 ```bash
-npm run binary   # produces bin/universal-browser-bridge (~60 MB)
+npm run serve
 ```
 
-The binary embeds the runtime, so end users need neither Node nor `npm install`. Cross-compile for other platforms with `bun build --compile --target=bun-linux-x64` (or `bun-windows-x64`, `bun-darwin-x64`, `bun-darwin-arm64`).
-
-## Start the daemon
-
-`serve` is the one long-running process that owns the extension WebSocket (port `17321` by default) and the authoritative tab/pending-command state. Start it once, before connecting any MCP client:
+Equivalent direct command:
 
 ```bash
 node /absolute/path/to/universal-browser-bridge/dist/cli.js serve
-# or, using the standalone binary:
-/absolute/path/to/universal-browser-bridge/bin/universal-browser-bridge serve
 ```
 
-It prints the extension endpoint, the control socket path, and the token path, then keeps running. Leave it running (in a terminal, tmux pane, or process supervisor) for as long as you want agents to have browser access; `Ctrl-C` stops it and disconnects every adapter.
+Expected startup output resembles:
 
-## Connect MCP clients (adapters)
+```text
+Universal Browser Bridge daemon listening.
+  Extension endpoint: 127.0.0.1:17321
+  Control socket:     ~/.universal-browser-bridge/daemon.sock
+  Token:               ~/.universal-browser-bridge/token
+```
 
-`mcp` is a lightweight client of the daemon: it never binds `17321` and holds no browser state of its own. Configure each MCP-compatible harness to run it — every harness gets its own adapter process, and any number can connect to the same `serve` daemon at once:
+`Ctrl-C` gracefully stops the daemon, disconnects all MCP adapters, and removes the control socket.
+
+### 5. Configure your MCP client
+
+The MCP command is:
 
 ```bash
 node /absolute/path/to/universal-browser-bridge/dist/cli.js mcp
-# or, using the standalone binary:
-/absolute/path/to/universal-browser-bridge/bin/universal-browser-bridge mcp
 ```
 
-If `serve` isn't running, `mcp` fails immediately with an explicit instruction to start it — it will not silently spawn a background daemon for you.
+Use an **absolute path** because MCP clients often launch subprocesses from a different working directory.
 
-Example MCP configuration:
+Standard MCP configuration:
 
 ```json
 {
@@ -78,61 +140,136 @@ Example MCP configuration:
         "/absolute/path/to/universal-browser-bridge/dist/cli.js",
         "mcp"
       ],
-      "env": { "UBB_CLIENT_LABEL": "claude-code" }
+      "env": {
+        "UBB_CLIENT_LABEL": "my-agent"
+      }
     }
   }
 }
 ```
 
-Use the equivalent MCP configuration surface in Codex, Claude Code, Hermes, or another compatible harness. Pi can use an MCP adapter or a future native extension.
+Use a different `UBB_CLIENT_LABEL` for each responsibility, for example `research`, `marketing`, or `coding`. The label appears in Chrome approval prompts and ownership errors.
 
-### Env vars
+#### Hermes Agent
+
+Add this to `~/.hermes/config.yaml`:
+
+```yaml
+mcp_servers:
+  browser-bridge:
+    command: node
+    args:
+      - /absolute/path/to/universal-browser-bridge/dist/cli.js
+      - mcp
+    env:
+      UBB_CLIENT_LABEL: hermes
+    enabled: true
+```
+
+Start a new Hermes session after changing MCP configuration. The discovered tools are prefixed by Hermes with the configured MCP server name.
+
+#### Multiple sessions and agents
+
+Each MCP configuration launches a lightweight adapter. All adapters connect to the same daemon, so multiple agent sessions can use the bridge simultaneously without competing for port `17321`.
+
+Do not configure every adapter to run `serve`. Only one daemon should run. Every MCP client should run `mcp`.
+
+### 6. Share a tab
+
+1. Open a normal `http://` or `https://` page.
+2. Click the extension toolbar icon.
+3. Confirm the tab shows an **ON** badge.
+4. Confirm Chrome placed it in the **Agent Bridge** tab group.
+5. Ask your agent to call `browser_status`, `browser_tabs`, or `browser_snapshot`.
+6. Click the toolbar icon again whenever you want to revoke access.
+
+Chrome internal pages, extension pages, password-manager prompts, passkeys, native dialogs, and arbitrary desktop applications are intentionally outside the bridge's scope.
+
+## Available MCP tools
+
+| Tool | Purpose |
+| --- | --- |
+| `browser_status` | Show extension connection state and shared tabs |
+| `browser_tabs` | List explicitly shared tabs |
+| `browser_new_tab` | Open an agent-owned tab in the dedicated agent window |
+| `browser_close_tab` | Close a tab owned by the calling adapter |
+| `browser_snapshot` | Read compact interactive elements and receive a `snapshotId` |
+| `browser_navigate` | Navigate a shared tab to an allowed URL |
+| `browser_click` | Click a snapshot element, with approval when consequential |
+| `browser_type` | Replace the contents of a snapshot input element |
+| `browser_press` | Send a key press; Enter requires human approval |
+| `browser_scroll` | Scroll a shared page by pixels |
+| `browser_screenshot` | Capture a PNG screenshot of a shared tab |
+
+`browser_click` and `browser_type` require both the element `ref` and `snapshotId` returned by `browser_snapshot`. Take another snapshot after navigating.
+
+## Running automatically
+
+The daemon is deliberately a foreground process by default. For long-running use, supervise it with a tool appropriate to your operating system, such as:
+
+- macOS: LaunchAgent
+- Linux: systemd user service
+- Windows: Task Scheduler or a user service wrapper
+- Cross-platform development: tmux or another terminal multiplexer
+
+The daemon must run under the same user account that owns the token and control socket. Do not expose it through a public proxy.
+
+## Standalone binary
+
+With [Bun](https://bun.sh) installed, compile the CLI and dependencies into a self-contained executable:
+
+```bash
+npm run binary
+```
+
+Output:
+
+```text
+bin/universal-browser-bridge
+```
+
+Run it with:
+
+```bash
+./bin/universal-browser-bridge token
+./bin/universal-browser-bridge serve
+./bin/universal-browser-bridge mcp
+```
+
+Cross-compile by selecting a Bun target such as `bun-linux-x64`, `bun-windows-x64`, `bun-darwin-x64`, or `bun-darwin-arm64`.
+
+## Configuration
 
 | Variable | Applies to | Purpose |
 | --- | --- | --- |
-| `UBB_TOKEN_FILE` | `serve`, `mcp`, `token` | Override the pairing token file path (default `~/.universal-browser-bridge/token`) |
-| `UBB_SOCKET_PATH` | `serve`, `mcp` | Override the daemon control socket path (default `~/.universal-browser-bridge/daemon.sock`, or a named pipe on Windows) |
-| `UBB_PORT` | `serve` | Override the extension WebSocket port (default `17321`) |
-| `UBB_CLIENT_LABEL` | `mcp` | Human-readable identity for this adapter; shown in Chrome approval prompts and ownership errors so a person can tell which agent asked |
-| `UBB_ALLOW_PRIVATE_NETWORKS` | `mcp` | Allow navigation to `localhost`/private-network URLs |
+| `UBB_TOKEN_FILE` | `serve`, `mcp`, `token` | Token path; defaults to `~/.universal-browser-bridge/token` |
+| `UBB_TOKEN` | `serve`, `mcp`, `token` | Supply the token directly instead of reading a file |
+| `UBB_SOCKET_PATH` | `serve`, `mcp` | Control socket path; defaults to `~/.universal-browser-bridge/daemon.sock` or a Windows named pipe |
+| `UBB_PORT` | `serve` | Extension WebSocket port; defaults to `17321` |
+| `UBB_CLIENT_LABEL` | `mcp` | Human-readable adapter identity shown in approvals and errors |
+| `UBB_ALLOW_PRIVATE_NETWORKS` | `mcp` | Set to `1` to allow localhost and private-network navigation |
 
-### Logical identity limitation
+If you change `UBB_PORT`, update the extension Relay URL to match:
 
-Each `mcp` process generates a random client ID at startup and reports `UBB_CLIENT_LABEL` if set; the daemon uses that identity to attribute approval requests and to enforce tab-close ownership. A harness that spawns a fresh `mcp` process per turn or per subagent (some Hermes and generic subagent setups do this) gets a **new** logical identity each time, so a subagent cannot close a tab an earlier subagent created under the same harness — set a stable `UBB_CLIENT_LABEL` per logical agent (not per process) if you want approval prompts to read consistently, but be aware tab ownership is still tied to the process-level client ID, not the label.
+```text
+ws://127.0.0.1:<port>/extension
+```
 
-## Share a tab
+## Token rotation
 
-1. Open a normal web page.
-2. Click the extension toolbar icon.
-3. Confirm the tab shows an **ON** badge and is inside the **Agent Bridge** group.
-4. Ask the connected agent to run `browser_status` or `browser_tabs`.
-5. Click the extension icon again to revoke access immediately.
+To invalidate the current token:
 
-Chrome internal pages, extension pages, password-manager prompts, passkeys, native dialogs, and arbitrary desktop applications are intentionally outside the MVP.
+1. Stop the daemon and all MCP adapters.
+2. Delete or move `~/.universal-browser-bridge/token`.
+3. Run `npm run token` to generate a fresh token.
+4. Paste the new token into the extension Options page.
+5. Restart the daemon and MCP clients.
 
-## Security boundaries
+A token rotation disconnects every process still using the previous token.
 
-- The extension WebSocket listens only on IPv4 loopback.
-- Extension connections must originate from a Chrome extension and present the pairing token.
-- The daemon control socket (`serve` <-> `mcp` adapters) is a Unix domain socket (or Windows named pipe) under the user's home directory, created with owner-only (`0600`) permissions, and additionally requires every adapter to present the same pairing token before the daemon accepts any request — an unauthenticated or mistoken connection is dropped within 3 seconds without a response.
-- The token is generated with 256 bits of randomness and stored with user-only file permissions.
-- Only explicitly shared tabs are attached with `chrome.debugger`.
-- The agent cannot read password values through `browser_snapshot`.
-- Navigation and new tabs are restricted to `http:` and `https:` URLs, so the agent cannot point a shared tab at `file://` paths.
-- Potentially consequential clicks and Enter presses pause until you approve them in a Chrome popup, which now also states which adapter (`UBB_CLIENT_LABEL`, or a short client ID) is asking. The model cannot approve its own request.
-- The **Agent Bridge** tab group is enforced: dragging a tab out immediately revokes debugger access, and toolbar revocation removes it from the group.
-- Agent-created tabs live in a dedicated window and are owned by the adapter that created them; only that adapter's control-socket connection can close them, and every other client's close attempt is rejected before it ever reaches the extension. Creating the agent window requires a one-time human grant.
-- Per-tab operations (snapshot/click/type/navigate/press/scroll/screenshot) are serialized by the daemon through a per-tab queue, so two adapters acting on the same tab at once cannot interleave mid-action; a disconnecting client never leaves the queue stuck for the next one.
-- `browser_snapshot` returns a `snapshotId` tied to a per-tab generation counter that the daemon bumps on every navigation. `browser_click`/`browser_type` must pass the current `snapshotId` back; a stale one (taken before a navigation) is rejected with a clear error instead of silently acting on a different page.
-- Literal localhost and private-network URLs are blocked by default. For personal development against local apps, add `UBB_ALLOW_PRIVATE_NETWORKS=1` to the MCP server environment.
+## Testing
 
-Known limitations:
-
-- The pairing token is sent by the extension to whatever process is listening on the extension port (`127.0.0.1:17321` by default). Another local process that binds the port first could capture the token. Loopback binding keeps this local-only, but on a shared or compromised machine treat the token as exposed and rotate it by deleting the token file.
-- The confirmation heuristic is intentionally conservative and cannot identify every consequential action. Web content can contain prompt injection. Do not share banking, password-manager, or other highly sensitive tabs.
-- See [Logical identity limitation](#logical-identity-limitation) above: harnesses that respawn `mcp` per turn/subagent get a fresh, unrelated client identity each time, which affects tab-close ownership.
-
-## Development
+### Automated tests without Chrome
 
 ```bash
 npm run check
@@ -140,17 +277,150 @@ npm test
 npm run build
 ```
 
-`npm test` includes real-socket/real-process integration tests (`src/daemon.test.ts`, `src/cli-integration.test.ts`) that spin up an actual `serve` daemon and multiple `mcp`/control-socket clients against a fake (non-Chrome) extension WebSocket peer — no Chrome required, and no timers/sockets/temp files left behind.
+The test suite includes real local sockets and real subprocesses. It starts a daemon, multiple MCP adapters, and a fake extension WebSocket peer. No Chrome interaction is required.
 
-With the extension loaded and paired, `npm run e2e` runs a live end-to-end smoke test through Chrome: it starts a real `serve` daemon, connects two simultaneous `mcp` adapters, and exercises the non-consequential MCP tools, cross-adapter tab-ownership rejection, URL rejection, stale-snapshot handling, cleanup, and a 45-second wait to verify the service-worker keepalive. It never approves a Chrome dialog on your behalf — if one appears (e.g. the one-time agent-window grant), approve it by hand or the run stalls until its timeout.
+### Live Chrome E2E
 
-The extension is plain JavaScript, so no browser build step is required. Reload it in `chrome://extensions` after extension changes.
+First load and pair the extension, then run:
 
-## Next steps
+```bash
+npm run e2e
+```
 
-- Per-agent identities, capabilities, and expiring grants (beyond the current per-process client ID + label)
+The E2E suite:
+
+- Starts a real daemon
+- Connects two MCP adapters simultaneously
+- Creates an agent-owned tab
+- Verifies cross-adapter ownership isolation
+- Exercises snapshots, navigation, keys, scrolling, clicking, typing, and screenshots
+- Rejects `file://` navigation
+- Rejects stale snapshot generations
+- Waits 45 seconds to verify Manifest V3 service-worker keepalive
+- Closes the created tab and cleans up all subprocesses
+
+By default the E2E daemon uses an ephemeral port to avoid colliding with an existing daemon. The script prints the selected URL; update the extension Relay URL to that value. To use a stable test port:
+
+```bash
+E2E_PORT=17322 npm run e2e
+```
+
+Then set the extension Relay URL to:
+
+```text
+ws://127.0.0.1:17322/extension
+```
+
+The test never approves Chrome prompts itself. If Chrome asks to create the agent-controlled window, approve it manually.
+
+## Troubleshooting
+
+### Extension does not connect
+
+1. Confirm `serve` is running.
+2. Confirm the Relay URL uses the daemon's printed port.
+3. Confirm the token in extension Options matches `npm run token`.
+4. Click **Save and connect** after editing either field.
+5. Confirm Chrome's **Loaded from** path points to the intended `extension/` directory.
+6. Reload the extension after changing `extension/*.js`.
+7. Restart the daemon after rebuilding `src/*.ts`.
+
+You can inspect daemon health locally:
+
+```bash
+curl http://127.0.0.1:17321/health
+```
+
+A successful pairing reports `"connected": true`.
+
+### Toolbar badge meanings
+
+| Badge | Meaning |
+| --- | --- |
+| No badge | Connected or not currently reporting an error |
+| `?` | Pairing token is missing from extension settings |
+| `!` | Relay is disconnected |
+| `ON` | This tab is explicitly shared |
+| `ERR` | Chrome refused debugger attachment or tab sharing failed |
+
+### `EADDRINUSE` on port 17321
+
+Another daemon or older single-process bridge is already listening.
+
+```bash
+lsof -nP -iTCP:17321 -sTCP:LISTEN   # macOS/Linux
+```
+
+Stop the old process or choose another `UBB_PORT`. Only one `serve` daemon should own a given extension port.
+
+### MCP reports that the daemon is not running
+
+Start `serve` separately. The `mcp` command intentionally does not launch a hidden daemon:
+
+```bash
+npm run serve
+```
+
+### Shared tab disappears
+
+- Confirm the tab remains in the **Agent Bridge** group.
+- Renaming the group or dragging the tab out revokes access by design.
+- Clicking the extension icon toggles sharing.
+- Chrome may refuse debugger attachment while DevTools is attached to the same target.
+
+### New unpacked folder lost its settings
+
+Chrome assigns unpacked extensions an identity based partly on their loaded directory. Loading the same files from another checkout or worktree may create a separate extension with empty storage. Re-enter both the Relay URL and pairing token.
+
+### Changes are not taking effect
+
+- TypeScript/daemon change: run `npm run build`, then restart `serve` and MCP adapters.
+- Extension JavaScript change: click **Reload** in `chrome://extensions`.
+- MCP client configuration change: restart the MCP client or start a new agent session.
+
+## Security boundaries
+
+- All network listeners bind to IPv4 loopback.
+- The extension accepts only `chrome-extension://` WebSocket origins with the pairing token.
+- The local control socket is owner-only and also token-authenticated.
+- Only explicitly shared tabs are attached through `chrome.debugger`.
+- Password input values are omitted from snapshots.
+- Navigation and new tabs accept only allowed `http:` and `https:` URLs.
+- Localhost and private-network destinations are blocked unless explicitly enabled.
+- Consequential clicks and Enter presses require Chrome-hosted human approval.
+- The model cannot approve its own request.
+- Agent-created tabs belong to their creating adapter while it is connected.
+- Per-tab queues prevent concurrent agents from interleaving actions.
+- Snapshot generations prevent old references from acting after navigation.
+- Dragging a tab out of the **Agent Bridge** group revokes access.
+
+Do not share banking, password-manager, payment, healthcare, or other highly sensitive tabs. Web content can contain prompt injection, and the consequential-action heuristic cannot recognize every risky interaction.
+
+## Known limitations
+
+- A local malicious process that binds the extension port first could capture the pairing token when the extension connects. Rotate the token if you suspect local compromise.
+- Client identity is process-scoped. A harness that launches a fresh MCP adapter per turn or subagent gets a new identity.
+- `UBB_CLIENT_LABEL` improves attribution but is not an authorization credential.
+- The confirmation heuristic is conservative but not comprehensive.
+- The extension is currently distributed as an unpacked extension rather than through the Chrome Web Store.
+- The daemon is not installed as an operating-system service automatically.
+
+## Development notes
+
+- Extension code is plain JavaScript; no browser build step is required.
+- Daemon and MCP code is TypeScript compiled to `dist/`.
+- `npm test` covers unit, socket, process, ownership, and Chrome-event-ordering behavior.
+- The live E2E was last verified at **17/17 passing** with two simultaneous adapters and real Chrome.
+
+## Roadmap
+
+- Stable logical identities and expiring grants
 - Domain policies and sensitive-site defaults
 - Append-only action audit log
 - Prompt-injection detection and untrusted-page labelling
-- Native adapters for Pi, Hermes, Codex, and OpenClaw
-- Chrome Web Store packaging and reproducible release artifacts
+- Native adapters for additional agent harnesses
+- Chrome Web Store packaging and reproducible releases
+
+## License
+
+MIT. See [LICENSE](LICENSE).
