@@ -7,6 +7,8 @@ import { WebSocket } from "ws";
 import { BrowserBridge } from "./bridge.js";
 import { DaemonServer } from "./daemon.js";
 import { DaemonClient } from "./daemon-client.js";
+import { AnnotationStore } from "./annotations.js";
+import { annotationDraft, annotationScreenshot } from "./test-support/annotation-fixture.js";
 
 const TOKEN = "daemon-test-token";
 
@@ -22,6 +24,21 @@ class FakeExtension {
   maxConcurrentCreateTab = 0;
   private concurrentCreateTab = 0;
   onCdp?: (method: string, params: Record<string, unknown>) => void;
+  updates: any[] = [];
+
+  annotationRequest(body: Record<string, unknown>): Promise<any> {
+    const id = randomUUID();
+    return new Promise((resolve) => {
+      const listener = (raw: Buffer) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type !== "annotationsResponse" || message.id !== id) return;
+        this.ws.off("message", listener);
+        resolve(message);
+      };
+      this.ws.on("message", listener);
+      this.send({ ...body, id });
+    });
+  }
 
   async connect(port: number): Promise<void> {
     this.ws = new WebSocket(`ws://127.0.0.1:${port}/extension`, { headers: { origin: "chrome-extension://fake" } });
@@ -45,6 +62,7 @@ class FakeExtension {
   }
 
   private async handle(message: any): Promise<void> {
+    if (message.type === "annotationUpdated") { this.updates.push(message.annotation); return; }
     if (message.type !== "command") return;
     const { id, action } = message;
     try {
@@ -124,7 +142,7 @@ beforeEach(async () => {
   socketPath = join(tempDir, "daemon.sock");
   bridge = new BrowserBridge(TOKEN, "127.0.0.1", 0);
   await bridge.start();
-  daemon = new DaemonServer(bridge, TOKEN, socketPath);
+  daemon = new DaemonServer(bridge, TOKEN, socketPath, new AnnotationStore(join(tempDir, "annotations")));
   await daemon.start();
   extension = new FakeExtension();
   await extension.connect(bridge.port);
@@ -141,6 +159,41 @@ afterEach(async () => {
 });
 
 describe("DaemonServer + DaemonClient", () => {
+  it("saves and lists annotations from the authenticated extension, then exposes and resolves them over control IPC", async () => {
+    const client = makeClient();
+    await client.connect();
+    const tab = await client.request({ action: "createTab", url: annotationDraft.url }) as { id: number };
+    const saved = await extension.annotationRequest({ type: "annotationsSave", tabId: tab.id, annotation: annotationDraft, screenshot: annotationScreenshot });
+    expect(saved.error).toBeUndefined();
+    const item = saved.result;
+    expect(item.screenshotPath).toBe(join(tempDir, "annotations", `${item.id}.png`));
+    expect((await extension.annotationRequest({ type: "annotationsList", tabId: tab.id, url: annotationDraft.url })).result).toEqual([item]);
+    expect(await client.request({ action: "annotationsList", status: "open" })).toEqual([item]);
+    expect(await client.request({ action: "annotationsGet", annotationId: item.id })).toEqual(item);
+    expect(await client.request({ action: "annotationsGet", url: annotationDraft.url })).toEqual([item]);
+    const resolved = await client.request({ action: "annotationsResolve", annotationId: item.id, note: "Done" });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(extension.updates).toContainEqual(resolved);
+    expect(await client.request({ action: "annotationsList", status: "open" })).toEqual([]);
+    expect(await client.request({ action: "annotationsList", status: "resolved" })).toEqual([resolved]);
+    extension.close();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(await client.request({ action: "annotationsGet", annotationId: item.id })).toEqual(resolved);
+  });
+
+  it("rejects extension annotation requests for unshared tabs and mismatched URLs", async () => {
+    expect((await extension.annotationRequest({ type: "annotationsSave", tabId: 999, annotation: annotationDraft, screenshot: annotationScreenshot })).error).toMatch(/shared/);
+    const client = makeClient();
+    await client.connect();
+    const tab = await client.request({ action: "createTab", url: annotationDraft.url }) as { id: number };
+    expect((await extension.annotationRequest({ type: "annotationsList", tabId: tab.id, url: "https://other.example/" })).error).toMatch(/same URL/);
+    expect((await extension.annotationRequest({ type: "annotationsSave", tabId: tab.id, annotation: { ...annotationDraft, comment: " " }, screenshot: annotationScreenshot })).error).toBeTruthy();
+    expect(await client.request({ action: "annotationsList" })).toEqual([]);
+    await expect(client.request({ action: "annotationsGet" })).rejects.toThrow(/required/);
+    await expect(client.request({ action: "annotationsGet", annotationId: "invalid", url: annotationDraft.url })).rejects.toThrow(/not both/);
+    await expect(client.request({ action: "annotationsResolve" })).rejects.toThrow(/required/);
+  });
+
   it("lets two MCP clients connect to one daemon simultaneously without EADDRINUSE", async () => {
     const a = makeClient("client-a");
     const b = makeClient("client-b");

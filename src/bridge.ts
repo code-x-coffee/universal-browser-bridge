@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { WebSocketServer, WebSocket } from "ws";
-import { PROTOCOL_VERSION, type BridgeCommand, type BridgeStatus, type ExtensionMessage, type SharedTab } from "./protocol.js";
+import { PROTOCOL_VERSION, type AnnotationExtensionMessage, type BridgeCommand, type BridgeStatus, type ExtensionMessage, type SharedTab } from "./protocol.js";
 import { tokensMatch } from "./auth.js";
 
 type Pending = { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout };
@@ -64,6 +64,10 @@ export class BrowserBridge extends EventEmitter {
     return { connected: this.extension?.readyState === WebSocket.OPEN, protocolVersion: PROTOCOL_VERSION, tabs: this.tabs };
   }
 
+  sendAnnotations(message: AnnotationExtensionMessage): void {
+    if (this.extension?.readyState === WebSocket.OPEN) this.extension.send(JSON.stringify(message));
+  }
+
   async command(command: Omit<BridgeCommand, "type" | "id">): Promise<unknown> {
     if (!this.extension || this.extension.readyState !== WebSocket.OPEN) {
       throw new Error("Chrome extension is not connected");
@@ -98,7 +102,7 @@ export class BrowserBridge extends EventEmitter {
         if (
           message.type !== "hello" ||
           message.version !== PROTOCOL_VERSION ||
-          !tokensMatch(message.token, this.token)
+          typeof message.token !== "string" || !tokensMatch(message.token, this.token)
         ) {
           ws.close(4401, "Authentication failed");
           return;
@@ -109,6 +113,13 @@ export class BrowserBridge extends EventEmitter {
         this.extension = ws;
         ws.send(JSON.stringify({ type: "ready", version: PROTOCOL_VERSION }));
         ws.send(JSON.stringify({ type: "command", id: randomUUID(), action: "listTabs" }));
+        return;
+      }
+
+      // A replaced authenticated peer must not mutate the current session.
+      if (this.extension !== ws) return;
+      if (message.type === "annotationsSave" || message.type === "annotationsList") {
+        this.emit("annotations", message);
         return;
       }
 
