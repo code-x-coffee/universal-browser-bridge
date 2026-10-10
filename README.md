@@ -1,3 +1,5 @@
+<img src="docs/assets/logo-1024.png" width="96" alt="Universal Agent Browser Bridge logo">
+
 # Universal Agent Browser Bridge
 
 A local, agent-agnostic bridge that lets MCP-compatible AI agents operate only the Chrome tabs you explicitly share.
