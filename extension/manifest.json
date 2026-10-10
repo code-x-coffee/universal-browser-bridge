@@ -9,7 +9,7 @@
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
   },
-  "permissions": ["debugger", "tabs", "tabGroups", "storage"],
+  "permissions": ["debugger", "tabs", "tabGroups", "storage", "activeTab", "scripting", "contextMenus"],
   "host_permissions": ["http://127.0.0.1/*"],
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'; connect-src ws://127.0.0.1:*"
@@ -17,6 +17,12 @@
   "background": {
     "service_worker": "background.js",
     "type": "module"
+  },
+  "commands": {
+    "toggle-annotate": {
+      "suggested_key": { "default": "Alt+Shift+A", "mac": "MacCtrl+Shift+A" },
+      "description": "Toggle annotations on the current shared tab"
+    }
   },
   "action": {
     "default_title": "Share or unshare this tab with agents",

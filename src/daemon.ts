@@ -2,8 +2,9 @@ import { unlink } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import type { BrowserBridge } from "./bridge.js";
 import { tokensMatch } from "./auth.js";
+import { AnnotationStore } from "./annotations.js";
 import { isPotentiallyConsequential } from "./policy.js";
-import { PROTOCOL_VERSION, type ControlClientMessage, type ControlServerMessage, type SharedTab } from "./protocol.js";
+import { PROTOCOL_VERSION, type AnnotationExtensionRequest, type ControlClientMessage, type ControlServerMessage, type SharedTab } from "./protocol.js";
 import { clickDetailsScript, clickScript, describeKey, scrollScript, snapshotScript, typeScript } from "./dom-actions.js";
 import { TabLeaseManager } from "./tab-lease.js";
 
@@ -47,11 +48,13 @@ export class DaemonServer {
   constructor(
     private readonly bridge: BrowserBridge,
     private readonly token: string,
-    private readonly socketPath: string
+    private readonly socketPath: string,
+    private readonly annotations = new AnnotationStore()
   ) {
     // Reconcile ownership/lease state for tabs that vanish out-of-band (the
     // user closes them directly in Chrome, or the extension disconnects).
     this.bridge.on("tabs", (tabs: SharedTab[]) => this.reconcileTabs(tabs));
+    this.bridge.on("annotations", this.handleAnnotations);
   }
 
   async start(): Promise<void> {
@@ -62,11 +65,29 @@ export class DaemonServer {
   }
 
   async stop(): Promise<void> {
+    this.bridge.off("annotations", this.handleAnnotations);
     for (const client of this.clients.values()) client.socket.destroy();
     this.clients.clear();
     await new Promise<void>((resolve) => (this.server ? this.server.close(() => resolve()) : resolve()));
     if (process.platform !== "win32") await unlink(this.socketPath).catch(() => {});
   }
+
+  private handleAnnotations = async (message: AnnotationExtensionRequest): Promise<void> => {
+    try {
+      const tab = this.bridge.status().tabs.find((tab) => tab.id === message.tabId);
+      const url = message.type === "annotationsSave" ? message.annotation?.url : message.url;
+      if (!tab || tab.url !== url) throw new Error("Annotations require a currently shared tab at the same URL");
+      const result = message.type === "annotationsSave"
+        ? await this.annotations.create(message.annotation, message.screenshot)
+        : await this.annotations.list({ url });
+      this.bridge.sendAnnotations({ type: "annotationsResponse", id: message.id, result });
+      if (message.type === "annotationsSave") {
+        this.bridge.sendAnnotations({ type: "annotationUpdated", annotation: result as Awaited<ReturnType<AnnotationStore["create"]>> });
+      }
+    } catch (error) {
+      this.bridge.sendAnnotations({ type: "annotationsResponse", id: message.id, error: (error as Error).message });
+    }
+  };
 
   // Restricts the socket file to owner-only (0600) from the moment it is
   // created, by narrowing the process umask around the synchronous bind()
@@ -144,7 +165,7 @@ export class DaemonServer {
         }
 
         if (!authenticated) {
-          if (message.type !== "hello" || !tokensMatch(message.token, this.token)) {
+          if (message.type !== "hello" || typeof message.token !== "string" || !tokensMatch(message.token, this.token)) {
             socket.destroy();
             return;
           }
@@ -210,6 +231,19 @@ export class DaemonServer {
 
     if (action === "status") return this.bridge.status();
     if (action === "listTabs") return this.bridge.command({ action: "listTabs" });
+    if (action === "annotationsList") return this.annotations.list({ url: message.url, status: message.status });
+    if (action === "annotationsGet") {
+      if (message.annotationId && message.url !== undefined) throw new Error("Specify an annotation ID or URL, not both");
+      if (message.annotationId) return this.annotations.get(message.annotationId);
+      if (message.url !== undefined) return this.annotations.list({ url: message.url });
+      throw new Error("annotationId or url is required");
+    }
+    if (action === "annotationsResolve") {
+      if (!message.annotationId) throw new Error("annotationId is required");
+      const annotation = await this.annotations.resolve(message.annotationId, message.note);
+      this.bridge.sendAnnotations({ type: "annotationUpdated", annotation });
+      return annotation;
+    }
 
     if (action === "createTab") {
       return this.leases.runExclusive(CREATE_TAB_LOCK, async () => {

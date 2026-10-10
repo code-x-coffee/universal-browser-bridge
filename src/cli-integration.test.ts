@@ -20,6 +20,21 @@ class FakeExtension {
   ws!: WebSocket;
   private nextTabId = 1;
   tabs: { id: number; title: string; url: string; active: boolean }[] = [];
+  updates: any[] = [];
+
+  annotationRequest(body: Record<string, unknown>): Promise<any> {
+    const id = "annotation-test-request";
+    return new Promise((resolve) => {
+      const listener = (raw: Buffer) => {
+        const message = JSON.parse(raw.toString());
+        if (message.type !== "annotationsResponse" || message.id !== id) return;
+        this.ws.off("message", listener);
+        resolve(message);
+      };
+      this.ws.on("message", listener);
+      this.send({ ...body, id });
+    });
+  }
 
   async connect(port: number, token: string): Promise<void> {
     this.ws = new WebSocket(`ws://127.0.0.1:${port}/extension`, { headers: { origin: "chrome-extension://fake" } });
@@ -36,6 +51,7 @@ class FakeExtension {
   }
 
   private async handle(message: any): Promise<void> {
+    if (message.type === "annotationUpdated") { this.updates.push(message.annotation); return; }
     if (message.type !== "command") return;
     const { id, action } = message;
     if (action === "listTabs") return this.send({ type: "response", id, result: this.tabs });
@@ -102,7 +118,8 @@ beforeEach(async () => {
     ...process.env,
     UBB_TOKEN_FILE: join(tempDir, "token"),
     UBB_SOCKET_PATH: join(tempDir, "daemon.sock"),
-    UBB_PORT: "0"
+    UBB_PORT: "0",
+    UBB_DATA_DIR: tempDir
   };
 });
 
@@ -140,7 +157,47 @@ async function startMcpClient(label: string): Promise<Client> {
 
 const textOf = (result: any) => result.content?.find((c: any) => c.type === "text")?.text ?? "";
 
+async function annotationsCli(args: string[]) {
+  const child = spawn(TSX, ["src/cli.ts", "annotations", ...args], { cwd: PROJECT_ROOT, env });
+  mcpProcesses.push(child);
+  let stdout = "", stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+  child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+  const code = await new Promise<number | null>((resolve) => child.once("close", resolve));
+  return { code, stdout, stderr };
+}
+
 describe("CLI serve + mcp (real processes, no Chrome)", () => {
+  it("exposes saved annotations through real CLI output and MCP tools", async () => {
+    const { annotationDraft, annotationScreenshot } = await import("./test-support/annotation-fixture.js");
+    const { port, token } = await startServe();
+    extension = new FakeExtension();
+    await extension.connect(port, token);
+    const client = await startMcpClient("annotation-client");
+    const tools = (await client.listTools()).tools.map((tool) => tool.name);
+    expect(tools).toEqual(expect.arrayContaining(["annotations_list", "annotations_get", "annotations_resolve"]));
+    const tab = JSON.parse(textOf(await client.callTool({ name: "browser_new_tab", arguments: { url: annotationDraft.url } })));
+    const saved = await extension.annotationRequest({ type: "annotationsSave", tabId: tab.id, annotation: annotationDraft, screenshot: annotationScreenshot });
+    expect(saved.error).toBeUndefined();
+    const item = saved.result;
+    expect(item.screenshotPath).toBe(join(tempDir, "annotations", `${item.id}.png`));
+    const listed = await annotationsCli(["list", "--url", annotationDraft.url, "--status", "open", "--json"]);
+    expect(listed.code).toBe(0);
+    expect(JSON.parse(listed.stdout)).toEqual([item]);
+    expect(JSON.parse((await annotationsCli(["get", item.id])).stdout)).toEqual(item);
+    expect(JSON.parse((await annotationsCli(["get", "--url", annotationDraft.url])).stdout)).toEqual([item]);
+    expect(JSON.parse(textOf(await client.callTool({ name: "annotations_get", arguments: { id: item.id } })))).toEqual(item);
+    expect(JSON.parse(textOf(await client.callTool({ name: "annotations_get", arguments: { url: annotationDraft.url } })))).toEqual([item]);
+    const resolved = JSON.parse((await annotationsCli(["resolve", item.id, "--note", "Fixed via CLI"])).stdout);
+    expect(resolved).toMatchObject({ status: "resolved", resolutionNote: "Fixed via CLI" });
+    expect(JSON.parse(textOf(await client.callTool({ name: "annotations_list", arguments: { status: "resolved" } })))).toEqual([resolved]);
+    expect((await client.callTool({ name: "annotations_resolve", arguments: { id: item.id } })).isError).toBeFalsy();
+    expect((await client.callTool({ name: "annotations_get", arguments: {} })).isError).toBe(true);
+    const invalid = await annotationsCli(["list", "--status", "bad"]);
+    expect(invalid.code).toBe(1);
+    expect(invalid.stdout).toBe("");
+    expect(invalid.stderr).toBeTruthy();
+  }, 20_000);
   it(
     "runs two simultaneous mcp adapters against one serve daemon end-to-end",
     async () => {

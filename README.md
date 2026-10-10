@@ -187,6 +187,41 @@ Do not configure every adapter to run `serve`. Only one daemon should run. Every
 
 Chrome internal pages, extension pages, password-manager prompts, passkeys, native dialogs, and arbitrary desktop applications are intentionally outside the bridge's scope.
 
+## Annotations
+
+Share a normal HTTP(S) tab with the toolbar icon, then enter annotation mode with **Alt+Shift+A** (macOS: **Control+Shift+A**) or right-click the toolbar icon and choose **Annotate this tab**. The toolbar's normal click still toggles sharing. If the shortcut conflicts, change it at `chrome://extensions/shortcuts`.
+
+Hover to highlight an element, click to select it, or drag a rectangle. Enter a comment and click **Save**. **Cancel** discards the selection; **Esc** cancels the popup and exits annotation mode. Numbered pins show comments on hover or click. Resolved pins turn grey, and updates appear on every shared tab at the same exact URL. Reloading that URL restores its pins.
+
+Each save captures a PNG of the visible viewport with the annotation overlay hidden. Keep that tab active in its window until saving finishes. Metadata includes the selector, a short text snippet, page rectangle, viewport, scroll position, URL, title and timestamps. Pins follow the selector when it still exists, including the region's saved offset from its anchor; otherwise they use the original page coordinates.
+
+The daemon stores private files in `~/.universal-browser-bridge/annotations/`: `annotations.json` and `<id>.png`. Set `UBB_DATA_DIR` on **serve** to change the data root. The daemon is the sole writer and commits files with temporary-file renames. Annotation queries and resolution also work when Chrome is disconnected.
+
+```bash
+universal-browser-bridge annotations list --status open --json
+universal-browser-bridge annotations list --url 'https://example.com/'
+universal-browser-bridge annotations get <id>
+universal-browser-bridge annotations get --url 'https://example.com/'
+universal-browser-bridge annotations resolve <id> --note 'Fixed the heading'
+```
+
+CLI output is JSON. List defaults to all statuses; URL filters match exactly, including query strings and fragments. `get <id>` returns one record, and `get --url` returns an array. Both include an absolute `screenshotPath`. Resolution is idempotent and preserves the first resolution timestamp and note.
+
+MCP provides the same operations. For an existing `ubb <tool_name> '<json>'` wrapper:
+
+```bash
+ubb annotations_list '{"status":"open","url":"https://example.com/"}'
+ubb annotations_get '{"id":"<id>"}'
+ubb annotations_get '{"url":"https://example.com/"}'
+ubb annotations_resolve '{"id":"<id>","note":"Fixed the heading"}'
+```
+
+Annotations use the existing token-authenticated WebSocket and control socket, with no additional listener. The extension adds `scripting`, `contextMenus` and `activeTab`, with no broad website host permission. Chrome grants `activeTab` on a toolbar click, annotation shortcut or context-menu invocation; automatic injection still requires the tab to be shared. Same-origin reloads retain the grant. After crossing origins, or on an agent-created tab without a user gesture, invoke the annotation shortcut or context menu again to grant access. Unsharing removes the overlay.
+
+V1 annotations target the top-level document. Iframes and elements inside shadow roots cannot be individually selected. Screenshots show only the viewport; coordinates and selectors may become less accurate after major page changes. Data remains local until an agent reads it through the bridge.
+
+**After updating, reload the extension at `chrome://extensions` and rebuild/restart the daemon and MCP adapters.** Live annotation interaction in Chrome is a separate manual check from the automated mock, socket and process tests.
+
 ## Available MCP tools
 
 | Tool | Purpose |
@@ -202,6 +237,9 @@ Chrome internal pages, extension pages, password-manager prompts, passkeys, nati
 | `browser_press` | Send a key press; Enter requires human approval |
 | `browser_scroll` | Scroll a shared page by pixels |
 | `browser_screenshot` | Capture a PNG screenshot of a shared tab |
+| `annotations_list` | List saved annotations by exact URL and status |
+| `annotations_get` | Get an annotation by ID or all annotations for a URL |
+| `annotations_resolve` | Resolve an annotation and update live pins |
 
 `browser_click` and `browser_type` require both the element `ref` and `snapshotId` returned by `browser_snapshot`. Take another snapshot after navigating.
 
@@ -244,9 +282,10 @@ Cross-compile by selecting a Bun target such as `bun-linux-x64`, `bun-windows-x6
 
 | Variable | Applies to | Purpose |
 | --- | --- | --- |
-| `UBB_TOKEN_FILE` | `serve`, `mcp`, `token` | Token path; defaults to `~/.universal-browser-bridge/token` |
-| `UBB_TOKEN` | `serve`, `mcp`, `token` | Supply the token directly instead of reading a file |
-| `UBB_SOCKET_PATH` | `serve`, `mcp` | Control socket path; defaults to `~/.universal-browser-bridge/daemon.sock` or a Windows named pipe |
+| `UBB_TOKEN_FILE` | `serve`, `mcp`, `token`, `annotations` | Token path; defaults to `~/.universal-browser-bridge/token` |
+| `UBB_TOKEN` | `serve`, `mcp`, `token`, `annotations` | Supply the token directly instead of reading a file |
+| `UBB_SOCKET_PATH` | `serve`, `mcp`, `annotations` | Control socket path; defaults to `~/.universal-browser-bridge/daemon.sock` or a Windows named pipe |
+| `UBB_DATA_DIR` | `serve` | Annotation data root; defaults to `~/.universal-browser-bridge` |
 | `UBB_PORT` | `serve` | Extension WebSocket port; defaults to `17321` |
 | `UBB_CLIENT_LABEL` | `mcp` | Human-readable adapter identity shown in approvals and errors |
 | `UBB_ALLOW_PRIVATE_NETWORKS` | `mcp` | Set to `1` to allow localhost and private-network navigation |

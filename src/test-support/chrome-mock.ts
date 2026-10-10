@@ -39,12 +39,15 @@ export function createChromeMock(options: { delays?: ChromeMockDelays } = {}) {
   let nextGroupId = 1;
   let nextWindowId = 1;
 
-  const tabsOnUpdated: Array<(tabId: number, changeInfo: { groupId?: number }, tab: MockTab) => void> = [];
+  const tabsOnUpdated: Array<(tabId: number, changeInfo: { groupId?: number; status?: string; url?: string }, tab: MockTab) => void> = [];
   const tabsOnRemoved: Array<(tabId: number) => void> = [];
   const tabGroupsOnUpdated: Array<(group: MockGroup) => void> = [];
   const actionOnClicked: Array<(tab: MockTab) => Promise<void>> = [];
   const debuggerOnDetach: Array<(source: { tabId: number }, reason: string) => void> = [];
   const actionTitles = new Map<number, string>();
+  const commandsOnCommand: Array<(command: string, tab?: MockTab) => void> = [];
+  const contextMenusOnClicked: Array<(info: { menuItemId: string }, tab?: MockTab) => void> = [];
+  const runtimeOnMessage: Array<(message: any, sender: any, respond: (response: any) => void) => boolean | void> = [];
 
   const sessionStore = new Map<string, unknown>();
   const localStore = new Map<string, unknown>();
@@ -169,8 +172,11 @@ export function createChromeMock(options: { delays?: ChromeMockDelays } = {}) {
       },
       onUpdated: { addListener: (fn: (typeof tabsOnUpdated)[number]) => tabsOnUpdated.push(fn) },
       onRemoved: { addListener: (fn: (typeof tabsOnRemoved)[number]) => tabsOnRemoved.push(fn) },
-      query: async ({ groupId }: { groupId: number }) =>
-        [...tabsById.values()].filter((t) => t.groupId === groupId).map((t) => ({ ...t }))
+      query: async ({ groupId, windowId, active }: { groupId?: number; windowId?: number; active?: boolean; currentWindow?: boolean }) =>
+        [...tabsById.values()].filter((t) => (groupId === undefined || t.groupId === groupId) && (windowId === undefined || t.windowId === windowId) && (active === undefined || t.active === active)).map((t) => ({ ...t })),
+      sendMessage: async (_tabId: number, _message: unknown, _options?: { documentId: string }): Promise<any> => ({}),
+      captureVisibleTab: async (_windowId: number, _options: { format: string }) =>
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aM1sAAAAASUVORK5CYII="
     },
     tabGroups: {
       query: async ({ title, windowId }: { title: string; windowId: number }) =>
@@ -212,7 +218,14 @@ export function createChromeMock(options: { delays?: ChromeMockDelays } = {}) {
     },
     runtime: {
       getURL: (path: string) => `chrome-extension://faketestid/${path}`,
-      onMessage: { addListener: () => {} }
+      onMessage: { addListener: (fn: (typeof runtimeOnMessage)[number]) => runtimeOnMessage.push(fn) }
+    },
+    scripting: { executeScript: async (_injection: { target: { tabId: number }; files: string[] }) => [] },
+    commands: { onCommand: { addListener: (fn: (typeof commandsOnCommand)[number]) => commandsOnCommand.push(fn) } },
+    contextMenus: {
+      create: (_details: { id: string; title: string; contexts: string[] }) => "ubb-annotate",
+      remove: async (_id: string) => {},
+      onClicked: { addListener: (fn: (typeof contextMenusOnClicked)[number]) => contextMenusOnClicked.push(fn) }
     }
   };
 
@@ -227,5 +240,5 @@ export function createChromeMock(options: { delays?: ChromeMockDelays } = {}) {
     for (const fn of tabGroupsOnUpdated) fn({ ...group });
   }
 
-  return { chrome, simulateGroupRename, actionOnClicked, debuggerOnDetach, actionTitles };
+  return { chrome, simulateGroupRename, actionOnClicked, debuggerOnDetach, actionTitles, commandsOnCommand, contextMenusOnClicked, runtimeOnMessage, tabsOnUpdated, tabsById };
 }

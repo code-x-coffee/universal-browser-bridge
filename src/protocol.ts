@@ -1,3 +1,5 @@
+import type { Annotation, AnnotationDraft, AnnotationFilter } from "./annotations.js";
+
 export const PROTOCOL_VERSION = 1;
 
 export type SharedTab = {
@@ -12,7 +14,14 @@ export type ExtensionMessage =
   | { type: "tabs"; tabs: SharedTab[] }
   | { type: "response"; id: string; result?: unknown; error?: string }
   | { type: "event"; tabId: number; method: string; params: unknown }
+  | { type: "annotationsSave"; id: string; tabId: number; annotation: AnnotationDraft; screenshot: string }
+  | { type: "annotationsList"; id: string; tabId: number; url: string }
   | { type: "ping" };
+
+export type AnnotationExtensionRequest = Extract<ExtensionMessage, { type: "annotationsSave" | "annotationsList" }>;
+export type AnnotationExtensionMessage =
+  | { type: "annotationsResponse"; id: string; result?: Annotation | Annotation[]; error?: string }
+  | { type: "annotationUpdated"; annotation: Annotation };
 
 export type BridgeCommand = {
   type: "command";
@@ -51,7 +60,10 @@ export type ControlAction =
   | "navigate"
   | "press"
   | "scroll"
-  | "screenshot";
+  | "screenshot"
+  | "annotationsList"
+  | "annotationsGet"
+  | "annotationsResolve";
 
 export type ControlClientMessage =
   | { type: "hello"; token: string; clientId: string; label?: string; version: number }
@@ -67,6 +79,9 @@ export type ControlClientMessage =
       snapshotId?: string;
       key?: string;
       deltaY?: number;
+      annotationId?: string;
+      status?: AnnotationFilter["status"];
+      note?: string;
     };
 
 export type ControlServerMessage =
