@@ -42,6 +42,9 @@ export function createChromeMock(options: { delays?: ChromeMockDelays } = {}) {
   const tabsOnUpdated: Array<(tabId: number, changeInfo: { groupId?: number }, tab: MockTab) => void> = [];
   const tabsOnRemoved: Array<(tabId: number) => void> = [];
   const tabGroupsOnUpdated: Array<(group: MockGroup) => void> = [];
+  const actionOnClicked: Array<(tab: MockTab) => Promise<void>> = [];
+  const debuggerOnDetach: Array<(source: { tabId: number }, reason: string) => void> = [];
+  const actionTitles = new Map<number, string>();
 
   const sessionStore = new Map<string, unknown>();
   const localStore = new Map<string, unknown>();
@@ -186,23 +189,26 @@ export function createChromeMock(options: { delays?: ChromeMockDelays } = {}) {
       onUpdated: { addListener: (fn: (typeof tabGroupsOnUpdated)[number]) => tabGroupsOnUpdated.push(fn) }
     },
     debugger: {
-      attach: async () => {
+      attach: async (_target: { tabId: number }, _version: string) => {
         await wait(d("debuggerAttach", 0));
       },
-      detach: async () => {
+      detach: async (_target: { tabId: number }) => {
         await wait(d("debuggerDetach", 0));
       },
       sendCommand: async () => ({}),
-      onDetach: { addListener: () => {} }
+      onDetach: { addListener: (fn: (typeof debuggerOnDetach)[number]) => debuggerOnDetach.push(fn) }
     },
     action: {
-      setBadgeText: async () => {
+      setBadgeText: async (_details: { tabId?: number; text: string }) => {
         await wait(d("badge", 0));
       },
-      setBadgeBackgroundColor: async () => {
+      setBadgeBackgroundColor: async (_details: { tabId?: number; color: string }) => {
         await wait(d("badge", 0));
       },
-      onClicked: { addListener: () => {} }
+      setTitle: async ({ tabId, title }: { tabId: number; title: string }) => {
+        actionTitles.set(tabId, title);
+      },
+      onClicked: { addListener: (fn: (typeof actionOnClicked)[number]) => actionOnClicked.push(fn) }
     },
     runtime: {
       getURL: (path: string) => `chrome-extension://faketestid/${path}`,
@@ -221,5 +227,5 @@ export function createChromeMock(options: { delays?: ChromeMockDelays } = {}) {
     for (const fn of tabGroupsOnUpdated) fn({ ...group });
   }
 
-  return { chrome, simulateGroupRename };
+  return { chrome, simulateGroupRename, actionOnClicked, debuggerOnDetach, actionTitles };
 }

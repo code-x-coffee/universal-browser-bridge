@@ -1,5 +1,6 @@
 const PROTOCOL_VERSION = 1;
 const DEFAULT_URL = "ws://127.0.0.1:17321/extension";
+const DEFAULT_ACTION_TITLE = "Share or unshare this tab with agents";
 const AGENT_GROUP_TITLE = "Agent Bridge";
 const sharedTabs = new Set();
 const agentTabs = new Set();
@@ -92,12 +93,24 @@ async function handleMessage(message) {
 async function shareTab(tabId) {
   if (!tabId || sharedTabs.has(tabId)) return;
   await chrome.debugger.attach({ tabId }, "1.3");
-  sharedTabs.add(tabId);
-  await chrome.storage.session.set({ sharedTabIds: [...sharedTabs] });
-  await ensureAgentGroup(tabId);
-  await chrome.action.setBadgeText({ tabId, text: "ON" });
-  await chrome.action.setBadgeBackgroundColor({ tabId, color: "#0891b2" });
-  await sendTabs();
+  try {
+    sharedTabs.add(tabId);
+    await chrome.storage.session.set({ sharedTabIds: [...sharedTabs] });
+    await ensureAgentGroup(tabId);
+    await chrome.action.setBadgeText({ tabId, text: "ON" });
+    await chrome.action.setBadgeBackgroundColor({ tabId, color: "#0891b2" });
+    await chrome.action.setTitle({ tabId, title: DEFAULT_ACTION_TITLE }).catch(() => {});
+    await sendTabs();
+  } catch (error) {
+    sharedTabs.delete(tabId);
+    await chrome.storage.session.set({ sharedTabIds: [...sharedTabs] }).catch(() => {});
+    intentionalDetach.add(tabId);
+    await chrome.debugger.detach({ tabId }).catch(() => {});
+    intentionalDetach.delete(tabId);
+    await chrome.action.setBadgeText({ tabId, text: "" }).catch(() => {});
+    if (await isInAgentGroup(tabId)) await chrome.tabs.ungroup(tabId).catch(() => {});
+    throw error;
+  }
 }
 
 async function unshareTab(tabId, { ungroup = true } = {}) {
@@ -108,6 +121,7 @@ async function unshareTab(tabId, { ungroup = true } = {}) {
   intentionalDetach.delete(tabId);
   await chrome.storage.session.set({ sharedTabIds: [...sharedTabs] });
   await chrome.action.setBadgeText({ tabId, text: "" });
+  await chrome.action.setTitle({ tabId, title: DEFAULT_ACTION_TITLE }).catch(() => {});
   if (ungroup && await isInAgentGroup(tabId)) await chrome.tabs.ungroup(tabId).catch(() => {});
   await sendTabs();
 }
@@ -286,16 +300,29 @@ function setGlobalBadge(text, color) {
   chrome.action.setBadgeBackgroundColor({ color });
 }
 
+function explainShareError(error) {
+  const message = error?.message || String(error);
+  if (message.includes("Cannot access a chrome-extension:// URL of different extension")) {
+    return "Another extension (e.g. a password manager or Grammarly) has a frame in this page, so Chrome blocks debugging it. Limit that extension's site access to 'On click' and reload the tab, then try again.";
+  }
+  if (message.includes("Another debugger is already attached")) {
+    return "DevTools or another tab-controlling extension is already attached to this tab. Close it, then try again.";
+  }
+  return `Tab sharing failed: ${message}`;
+}
+
 chrome.action.onClicked.addListener(async (tab) => {
   if (!tab.id || tab.url?.startsWith("chrome://") || tab.url?.startsWith("chrome-extension://")) return;
   try {
     if (sharedTabs.has(tab.id)) await unshareTab(tab.id);
     else await shareTab(tab.id);
   } catch (error) {
-    // Attach can fail when DevTools is open on the tab or the page is policy-blocked.
+    // Attach can fail due to another extension's frame in the page,
+    // DevTools/another debugger attached to the tab, or policy-blocked pages.
     console.error("Failed to toggle tab sharing", error);
     await chrome.action.setBadgeText({ tabId: tab.id, text: "ERR" });
     await chrome.action.setBadgeBackgroundColor({ tabId: tab.id, color: "#b91c1c" });
+    await chrome.action.setTitle({ tabId: tab.id, title: explainShareError(error) }).catch(() => {});
   }
 });
 
