@@ -341,7 +341,14 @@ A successful pairing reports `"connected": true`.
 | `?` | Pairing token is missing from extension settings |
 | `!` | Relay is disconnected |
 | `ON` | This tab is explicitly shared |
-| `ERR` | Chrome refused debugger attachment or tab sharing failed |
+| `ERR` | Tab sharing failed; hover the toolbar icon to see the reason |
+
+### `ERR` badge when sharing a tab
+
+Hover the toolbar icon to see why sharing failed.
+
+- `Cannot access a chrome-extension:// URL of different extension` means another extension (e.g. a password manager or Grammarly) has a frame in the page. Open `chrome://extensions`, select that extension's **Details**, set **Site access** to **On click**, and reload the tab before trying again.
+- `Another debugger is already attached` means DevTools or another debugging extension is attached to that tab. Close DevTools or disconnect the other extension from the tab, then try again.
 
 ### `EADDRINUSE` on port 17321
 
