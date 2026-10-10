@@ -12,6 +12,8 @@ class Node {
   className = "";
   textContent = "";
   value = "";
+  title = "";
+  attributes = new Map<string, string>();
   parentElement?: Node;
   children: Node[] = [];
   shadow?: Node;
@@ -27,7 +29,7 @@ class Node {
   attachShadow() { this.shadow = new Node("shadow"); return this.shadow; }
   getRootNode() { return document; }
   getBoundingClientRect() { return this.rect; }
-  setAttribute() {}
+  setAttribute(name: string, value: string) { this.attributes.set(name, value); }
   addEventListener(type: string, listener: (...args: any[]) => any) { this.events.set(type, listener); }
   focus() {}
 }
@@ -60,6 +62,7 @@ beforeEach(() => {
     scrollX: 0, scrollY: 200,
     requestAnimationFrame: (callback: () => void) => setTimeout(callback, 0), cancelAnimationFrame: clearTimeout,
     setInterval, clearInterval,
+    setTimeout, clearTimeout,
     MutationObserver: class { observe() {} disconnect() {} },
     chrome: { runtime: { sendMessage: send, onMessage: { addListener: (fn: typeof receive) => { receive = fn; }, removeListener() {} } } },
     window: { addEventListener: (type: string, fn: (event: any) => void) => { listeners.set(type, fn); }, removeEventListener: (type: string) => { listeners.delete(type); } }
@@ -136,6 +139,47 @@ it("renders numbered, anchored and resolved pins and displays comments as plain 
   expect(pin.style.left).toBe("10px"); expect(pin.style.top).toBe("20px");
   pin.events.get("click")!();
   expect(all(root()).find((node) => node.className === "comment")?.textContent).toContain("Resolution: Done");
+});
+
+it.each([
+  { status: "open", replies: [], state: "", label: "Open" },
+  { status: "open", replies: [{ author: "agent", text: "Done", createdAt: "2026-10-10T10:00:00.000Z" }], state: "answered", label: "Answered" },
+  { status: "resolved", replies: [{ author: "agent", text: "Done", createdAt: "2026-10-10T10:00:00.000Z" }], state: "resolved", label: "Resolved" }
+])("renders accessible $label pin state", ({ status, replies, state, label }) => {
+  receive({ type: "ubbAnnotationsRender", url: annotationDraft.url, annotations: [{ ...annotationDraft, status, replies }] });
+  const pin = all(root()).find((node) => node.className === `pin ${state}`)!;
+  expect(pin.title).toBe(`${label} annotation 1`);
+  expect(pin.attributes.get("aria-label")).toContain(label);
+});
+
+it("renders replies in order below the original comment as text with author and localized time", () => {
+  const replies = [
+    { author: "<img src=x onerror=attack()>", text: "<script>attack()</script>", createdAt: "2026-10-10T10:00:00.000Z" },
+    { author: "Hephaestus", text: "Fixed\nSecond line", createdAt: "2026-10-10T11:00:00.000Z" }
+  ];
+  receive({ type: "ubbAnnotationsRender", url: annotationDraft.url, annotations: [{ ...annotationDraft, comment: "Original <b>comment</b>", status: "open", replies }] });
+  all(root()).find((node) => node.className === "pin answered")!.events.get("click")!();
+  const comment = all(root()).find((node) => node.className === "comment")!;
+  expect(comment.textContent).toBe("Original <b>comment</b>");
+  expect(comment.children.map((node) => node.textContent)).toEqual(replies.map((reply) => `\n\n${reply.author} · ${new Date(reply.createdAt).toLocaleString()}\n${reply.text}`));
+  expect(comment.children.every((node) => node.className === "reply" && node.children.length === 0)).toBe(true);
+  expect(all(comment).some((node) => ["img", "script", "b"].includes(node.localName))).toBe(false);
+  expect(all(root()).find((node) => node.localName === "style")!.textContent).toContain("max-height:45vh; overflow:auto");
+});
+
+it("keeps the thread open while moving from its pin into the scrollable popover", async () => {
+  receive({ type: "ubbAnnotationsRender", url: annotationDraft.url, annotations: [{ ...annotationDraft, status: "open", replies: [] }] });
+  const pin = all(root()).find((node) => node.className === "pin ")!;
+  pin.events.get("mouseenter")!();
+  pin.events.get("mouseleave")!();
+  await vi.advanceTimersByTimeAsync(100);
+  const comment = all(root()).find((node) => node.className === "comment")!;
+  comment.events.get("mouseenter")!();
+  await vi.advanceTimersByTimeAsync(300);
+  expect(all(root())).toContain(comment);
+  comment.events.get("mouseleave")!();
+  await vi.advanceTimersByTimeAsync(200);
+  expect(all(root())).not.toContain(comment);
 });
 
 it("clears pins on SPA navigation and cleans up listeners when unshared", async () => {

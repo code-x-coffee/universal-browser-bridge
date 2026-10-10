@@ -19,6 +19,8 @@
     textarea { width:100%; min-height:85px; resize:vertical; border:1px solid #94a3b8; color:#111827; background:white; border-radius:4px; padding:6px; margin-bottom:8px; }
     .error { color:#b91c1c; margin:6px 0; }
     .pin { position:fixed; border-radius:50%; min-width:26px; height:26px; padding:2px 5px; box-shadow:0 1px 5px #0005; }
+    .answered { background:#15803d; }
+    .answered::after { content:""; position:absolute; right:-2px; top:-2px; width:8px; height:8px; border:1px solid white; border-radius:50%; background:#15803d; }
     .resolved { background:#64748b; }
     .comment { white-space:pre-wrap; overflow-wrap:anywhere; max-height:45vh; overflow:auto; }
   `;
@@ -37,6 +39,7 @@
   let gesture;
   let popup;
   let commentPopup;
+  let commentHideTimer;
   let annotations = [];
   let pinNodes = [];
   let frame;
@@ -54,6 +57,9 @@
     Object.assign(outline.style, { display: "block", left: `${rect.left}px`, top: `${rect.top}px`, width: `${rect.width}px`, height: `${rect.height}px` });
   };
   const closePopup = () => { popup?.remove(); popup = undefined; outline.style.display = "none"; };
+  const hideComment = () => { clearTimeout(commentHideTimer); commentPopup?.remove(); commentPopup = undefined; };
+  // Allow crossing the small gap between a pin and its scrollable thread.
+  const hideCommentLater = () => { clearTimeout(commentHideTimer); commentHideTimer = setTimeout(hideComment, 200); };
   const setMode = (next) => {
     mode = next;
     hint.hidden = !next;
@@ -78,10 +84,21 @@
     frame = requestAnimationFrame(() => { frame = undefined; positionPins(); });
   }
   function showComment(item, pin) {
-    commentPopup?.remove();
+    hideComment();
     commentPopup = document.createElement("div");
     commentPopup.className = "comment";
+    commentPopup.tabIndex = 0;
+    commentPopup.addEventListener("mouseenter", () => clearTimeout(commentHideTimer));
+    commentPopup.addEventListener("focus", () => clearTimeout(commentHideTimer));
+    commentPopup.addEventListener("mouseleave", hideCommentLater);
+    commentPopup.addEventListener("blur", hideCommentLater);
     commentPopup.textContent = `${item.status === "resolved" ? "Resolved\n" : ""}${item.comment}${item.resolutionNote ? `\n\nResolution: ${item.resolutionNote}` : ""}`;
+    for (const reply of item.replies || []) {
+      const entry = document.createElement("div");
+      entry.className = "reply";
+      entry.textContent = `\n\n${reply.author} · ${new Date(reply.createdAt).toLocaleString()}\n${reply.text}`;
+      commentPopup.append(entry);
+    }
     root.append(commentPopup);
     const rect = pin.getBoundingClientRect();
     place(commentPopup, rect.right + 8, rect.top);
@@ -90,16 +107,19 @@
     if (location.href !== pageUrl) return;
     annotations = items;
     pins.replaceChildren();
-    commentPopup?.remove();
+    hideComment();
     pinNodes = items.map((item, index) => {
       const pin = document.createElement("button");
-      pin.className = `pin ${item.status === "resolved" ? "resolved" : ""}`;
+      const state = item.status === "resolved" ? "resolved" : item.replies?.length ? "answered" : "";
+      const label = state === "resolved" ? "Resolved" : state === "answered" ? "Answered" : "Open";
+      pin.className = `pin ${state}`;
       pin.textContent = String(index + 1);
-      pin.setAttribute("aria-label", `Annotation ${index + 1}: ${item.comment}`);
+      pin.title = `${label} annotation ${index + 1}`;
+      pin.setAttribute("aria-label", `${label} annotation ${index + 1}: ${item.comment}`);
       pin.addEventListener("mouseenter", () => showComment(item, pin));
-      pin.addEventListener("mouseleave", () => { commentPopup?.remove(); });
+      pin.addEventListener("mouseleave", hideCommentLater);
       pin.addEventListener("focus", () => showComment(item, pin));
-      pin.addEventListener("blur", () => { commentPopup?.remove(); });
+      pin.addEventListener("blur", hideCommentLater);
       pin.addEventListener("click", () => showComment(item, pin));
       pins.append(pin);
       return pin;
@@ -194,7 +214,7 @@
     if (event.key === "Escape" && (mode || commentPopup)) {
       suppress(event);
       setMode(false);
-      commentPopup?.remove();
+      hideComment();
     } else if (mode && !isUI(event)) suppress(event);
   }
   const listeners = { pointerdown: down, pointermove: move, pointerup: up, click: blockClick, dblclick: blockClick, contextmenu: blockClick, keydown: key, keyup: blockClick, mousedown: blockClick, mouseup: blockClick };
@@ -222,6 +242,7 @@
     observer.disconnect();
     cancelAnimationFrame(frame);
     clearInterval(urlTimer);
+    clearTimeout(commentHideTimer);
     for (const [type, listener] of Object.entries(listeners)) window.removeEventListener(type, listener, true);
     window.removeEventListener("scroll", schedulePosition, true);
     window.removeEventListener("resize", schedulePosition);
