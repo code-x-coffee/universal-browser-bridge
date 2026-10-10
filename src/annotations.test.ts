@@ -61,6 +61,7 @@ describe("AnnotationStore", () => {
     });
     await expect(store.create(draft, screenshot)).rejects.toThrow("disk failure");
     await expect(store.resolve(first.id)).rejects.toThrow("disk failure");
+    await expect(store.reply(first.id, { text: "Not committed" })).rejects.toThrow("disk failure");
     expect(await store.list()).toEqual([first]);
     expect(await new AnnotationStore(store.directory).list()).toEqual([first]);
     expect(await fs.readdir(store.directory)).toHaveLength(2);
@@ -93,5 +94,50 @@ describe("AnnotationStore", () => {
   it("honors UBB_DATA_DIR", () => {
     vi.stubEnv("UBB_DATA_DIR", directory);
     expect(annotationDirectory()).toBe(join(directory, "annotations"));
+  });
+
+  it("appends trimmed replies with unique IDs, defaults authors and persists them on resolved records", async () => {
+    const item = await store.create(draft, screenshot);
+    expect(item.replies).toEqual([]);
+    const first = await store.reply(item.id, { text: "  First reply  " });
+    expect(first.replies[0]).toEqual({ id: expect.any(String), text: "First reply", author: "agent", createdAt: expect.any(String) });
+    expect(first.replies[0]!.id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(new Date(first.replies[0]!.createdAt).toISOString()).toBe(first.replies[0]!.createdAt);
+    const resolved = await store.resolve(item.id, "Done");
+    const updated = await store.reply(item.id, { text: "Confirmed", author: "  Hephaestus  " });
+    expect(updated).toMatchObject({ status: "resolved", resolvedAt: resolved.resolvedAt, resolutionNote: "Done" });
+    expect(updated.replies).toHaveLength(2);
+    expect(updated.replies[1]).toMatchObject({ text: "Confirmed", author: "Hephaestus" });
+    expect(updated.replies[0]!.id).not.toBe(updated.replies[1]!.id);
+    expect(await new AnnotationStore(store.directory).get(item.id)).toEqual(updated);
+    updated.replies[0]!.text = "Changed copy";
+    expect((await store.get(item.id)).replies[0]!.text).toBe("First reply");
+  });
+
+  it("loads legacy records without replies and persists their first reply", async () => {
+    const item = await store.create(draft, screenshot);
+    const { replies: _replies, ...legacy } = item;
+    await fs.writeFile(join(store.directory, "annotations.json"), JSON.stringify([legacy]));
+    const legacyStore = new AnnotationStore(store.directory);
+    expect((await legacyStore.get(item.id)).replies).toEqual([]);
+    const updated = await legacyStore.reply(item.id, { text: "Reply on legacy record" });
+    expect(await new AnnotationStore(store.directory).list()).toEqual([updated]);
+  });
+
+  it("serializes concurrent replies and resolution without losing updates", async () => {
+    const item = await store.create(draft, screenshot);
+    await Promise.all([...Array.from({ length: 8 }, (_, index) => store.reply(item.id, { text: `Reply ${index}` })), store.resolve(item.id)]);
+    expect(await store.get(item.id)).toMatchObject({ status: "resolved", replies: Array.from({ length: 8 }, (_, index) => expect.objectContaining({ text: `Reply ${index}` })) });
+  });
+
+  it("validates reply text/author lengths and IDs at the store boundary", async () => {
+    const item = await store.create(draft, screenshot);
+    for (const input of [{ text: " " }, { text: "x".repeat(10_001) }, { text: "valid", author: " " }, { text: "valid", author: "x".repeat(101) }]) {
+      await expect(store.reply(item.id, input)).rejects.toThrow();
+    }
+    await expect(store.reply("../../token", { text: "valid" })).rejects.toThrow();
+    await expect(store.reply("00000000-0000-4000-8000-000000000000", { text: "valid" })).rejects.toThrow("not found");
+    const boundary = await store.reply(item.id, { text: "x".repeat(10_000), author: "x".repeat(100) });
+    expect(boundary.replies[0]!.text).toHaveLength(10_000);
   });
 });

@@ -4,7 +4,7 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { z } from "zod";
 import type { DaemonClient } from "./daemon-client.js";
 import { assertBrowserUrlAllowed } from "./url-policy.js";
-import { annotationIdSchema, annotationStatusSchema } from "./annotations.js";
+import { annotationIdSchema, annotationReplySchema, annotationStatusSchema } from "./annotations.js";
 
 const httpUrl = z
   .string()
@@ -52,6 +52,12 @@ export async function runMcpServer(bridge: DaemonClient, transport: Transport = 
     async ({ id, note }) => text(await bridge.request({ action: "annotationsResolve", annotationId: id, note }))
   );
 
+  server.tool(
+    "annotations_reply",
+    "Reply to an open or resolved annotation and update its pins on open shared tabs. Author defaults to agent.",
+    { id: annotationIdSchema, ...annotationReplySchema.shape },
+    async ({ id, text: replyText, author }) => text(await bridge.request({ action: "annotationsReply", annotationId: id, text: replyText, author }))
+  );
   server.tool(
     "browser_new_tab",
     "Open a tab in the dedicated agent window. Chrome asks for a one-time session grant before creating that window. Only this client may close the tab it creates.",

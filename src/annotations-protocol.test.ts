@@ -1,12 +1,13 @@
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { BrowserBridge } from "./bridge.js";
 import { DaemonServer } from "./daemon.js";
 import { AnnotationStore } from "./annotations.js";
+import { AnnotationWebhook } from "./annotation-webhook.js";
 import { annotationDraft, annotationScreenshot } from "./test-support/annotation-fixture.js";
 
 // Socket API boundaries only. Real-socket integration lives in daemon.test.ts;
@@ -24,11 +25,15 @@ let directory: string;
 let bridge: BrowserBridge;
 let daemon: DaemonServer;
 let extension: Peer;
+let webhook: AnnotationWebhook;
+let fetcher: ReturnType<typeof vi.fn<typeof fetch>>;
 const controlPeers: Peer[] = [];
 beforeEach(async () => {
   directory = await mkdtemp(join(tmpdir(), "ubb-annotation-protocol-"));
   bridge = new BrowserBridge("test-token");
-  daemon = new DaemonServer(bridge, "test-token", join(directory, "daemon.sock"), new AnnotationStore(join(directory, "annotations")));
+  fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 204 }));
+  webhook = new AnnotationWebhook({ dataRoot: directory, env: {}, fetch: fetcher, sleep: async () => {} });
+  daemon = new DaemonServer(bridge, "test-token", join(directory, "daemon.sock"), new AnnotationStore(join(directory, "annotations")), webhook);
   extension = new Peer();
   // Drive the actual connection handlers through a stand-in for the ws/net
   // boundary rather than replacing their authenticated protocol logic.
@@ -41,6 +46,7 @@ afterEach(async () => {
   for (const peer of controlPeers.splice(0)) peer.destroy();
   await daemon.stop();
   await rm(directory, { recursive: true, force: true });
+  vi.restoreAllMocks();
 });
 function control(token = "test-token") {
   const peer = new Peer();
@@ -102,4 +108,57 @@ it("rejects unshared or different-URL extension writes and invalid control filte
   expect((await request(peer, { action: "annotationsGet" })).error).toMatch(/required/);
   expect((await request(peer, { action: "annotationsGet", annotationId: "invalid", url: annotationDraft.url })).error).toMatch(/not both/);
   expect((await request(peer, { action: "annotationsResolve", annotationId: "../../token" })).error).toBeTruthy();
+  expect((await request(peer, { action: "annotationsReply" })).error).toMatch(/required/);
+  expect((await request(peer, { action: "annotationsReply", annotationId: "../../token", text: "Hello" })).error).toBeTruthy();
+});
+
+it("replies through the authenticated control action and broadcasts committed open/resolved threads", async () => {
+  const item = (await extensionRequest({ type: "annotationsSave", tabId: 1, annotation: annotationDraft, screenshot: annotationScreenshot })).result;
+  const peer = control();
+  const open = (await request(peer, { action: "annotationsReply", annotationId: item.id, text: "  Working on it  ", author: "Hephaestus" })).result;
+  expect(open).toMatchObject({ status: "open", replies: [{ text: "Working on it", author: "Hephaestus" }] });
+  expect(extension.messages).toContainEqual({ type: "annotationUpdated", annotation: open });
+  await request(peer, { action: "annotationsResolve", annotationId: item.id, note: "Done" });
+  const resolved = (await request(peer, { action: "annotationsReply", annotationId: item.id, text: "Verified" })).result;
+  expect(resolved).toMatchObject({ status: "resolved", resolutionNote: "Done", replies: [{ author: "Hephaestus" }, { author: "agent", text: "Verified" }] });
+  expect(extension.messages).toContainEqual({ type: "annotationUpdated", annotation: resolved });
+  expect((await request(peer, { action: "annotationsGet", annotationId: item.id })).result).toEqual(resolved);
+  const updates = extension.messages.filter((message) => message.type === "annotationUpdated").length;
+  for (const fields of [{}, { text: " " }, { text: "Hi", author: " " }]) {
+    expect((await request(peer, { action: "annotationsReply", annotationId: item.id, ...fields })).error).toBeTruthy();
+  }
+  expect(extension.messages.filter((message) => message.type === "annotationUpdated")).toHaveLength(updates);
+});
+
+it("sends a webhook only after a new save and uses the same sender for control status/test", async () => {
+  await writeFile(join(directory, "webhook.json"), JSON.stringify({ url: "https://hooks.example.com/?token=private", headers: { Authorization: "Bearer secret" } }));
+  const item = (await extensionRequest({ type: "annotationsSave", tabId: 1, annotation: annotationDraft, screenshot: annotationScreenshot })).result;
+  await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
+  expect(JSON.parse(fetcher.mock.calls[0]![1]!.body as string)).toMatchObject({ event: "annotation.created", annotation: { id: item.id } });
+  const peer = control();
+  await request(peer, { action: "annotationsReply", annotationId: item.id, text: "Done" });
+  await request(peer, { action: "annotationsResolve", annotationId: item.id });
+  await extensionRequest({ type: "annotationsList", tabId: 1, url: item.url });
+  await extensionRequest({ type: "annotationsSave", tabId: 1, annotation: { ...annotationDraft, comment: " " }, screenshot: annotationScreenshot });
+  expect(fetcher).toHaveBeenCalledTimes(1);
+  const status = (await request(peer, { action: "annotationsWebhookStatus" })).result;
+  expect(status).toEqual({ configured: true, enabled: true, source: "file", host: "hooks.example.com", headerNames: ["Authorization"] });
+  const tested = (await request(peer, { action: "annotationsWebhookTest" })).result;
+  expect(tested).toEqual({ ok: true, status: 204, attempts: 1 });
+  expect(JSON.parse(fetcher.mock.calls[1]![1]!.body as string)).toEqual({ event: "annotation.test", sentAt: expect.any(String) });
+});
+
+it.each(["throws", "rejects", "hangs"])("still saves and responds when the detached webhook %s", async (behavior) => {
+  const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+  const created = vi.spyOn(webhook, "created").mockImplementation(() => {
+    if (behavior === "throws") throw new Error("secret failure");
+    return behavior === "rejects" ? Promise.reject(new Error("secret failure")) : new Promise(() => {});
+  });
+  const saved = await extensionRequest({ type: "annotationsSave", tabId: 1, annotation: annotationDraft, screenshot: annotationScreenshot });
+  expect(saved.error).toBeUndefined();
+  expect(saved.result).toMatchObject({ status: "open", replies: [] });
+  expect(created).toHaveBeenCalledOnce();
+  expect((await request(control(), { action: "annotationsGet", annotationId: saved.result.id })).result).toEqual(saved.result);
+  expect(extension.messages).toContainEqual({ type: "annotationUpdated", annotation: saved.result });
+  if (behavior !== "hangs") expect(stderr).toHaveBeenCalledWith("Annotation webhook: delivery error\n");
 });

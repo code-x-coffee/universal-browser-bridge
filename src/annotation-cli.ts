@@ -1,17 +1,21 @@
-import { annotationIdSchema, annotationStatusSchema } from "./annotations.js";
+import { annotationIdSchema, annotationReplySchema, annotationStatusSchema } from "./annotations.js";
 import type { DaemonRequest } from "./daemon-client.js";
 
 export function parseAnnotationArgs(args: string[]): DaemonRequest {
   const [command, ...rest] = args;
-  if (command !== "list" && command !== "get" && command !== "resolve") {
-    throw new Error("Usage: annotations list [--url URL] [--status open|resolved|all] [--json] | get <id> | get --url URL | resolve <id> [--note TEXT]");
+  if (command === "webhook") {
+    if (rest.length !== 1 || (rest[0] !== "status" && rest[0] !== "test")) throw new Error("Usage: annotations webhook status|test");
+    return { action: rest[0] === "status" ? "annotationsWebhookStatus" : "annotationsWebhookTest" };
+  }
+  if (command !== "list" && command !== "get" && command !== "resolve" && command !== "reply") {
+    throw new Error("Usage: annotations list [--url URL] [--status open|resolved|all] [--json] | get <id> | get --url URL | resolve <id> [--note TEXT] | reply <id> --text TEXT [--author NAME] | webhook status|test");
   }
   const options = new Map<string, string>();
   const ids: string[] = [];
   for (let index = 0; index < rest.length; index++) {
     const arg = rest[index]!;
     if (!arg.startsWith("--")) { ids.push(arg); continue; }
-    const allowed = command === "list" ? ["--url", "--status", "--json"] : command === "get" ? ["--url"] : ["--note"];
+    const allowed = command === "list" ? ["--url", "--status", "--json"] : command === "get" ? ["--url"] : command === "reply" ? ["--text", "--author"] : ["--note"];
     if (!allowed.includes(arg) || options.has(arg)) throw new Error(`Invalid or duplicate option: ${arg}`);
     if (arg === "--json") { options.set(arg, "true"); continue; }
     const value = rest[++index];
@@ -28,5 +32,9 @@ export function parseAnnotationArgs(args: string[]): DaemonRequest {
   }
   if (ids.length !== 1) throw new Error(`annotations ${command} requires one annotation ID`);
   const annotationId = annotationIdSchema.parse(ids[0]);
+  if (command === "reply") {
+    const { text, author } = annotationReplySchema.parse({ text: options.get("--text"), author: options.get("--author") });
+    return { action: "annotationsReply", annotationId, text, author };
+  }
   return command === "get" ? { action: "annotationsGet", annotationId } : { action: "annotationsResolve", annotationId, note: options.get("--note") };
 }

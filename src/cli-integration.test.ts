@@ -119,6 +119,7 @@ beforeEach(async () => {
     UBB_TOKEN_FILE: join(tempDir, "token"),
     UBB_SOCKET_PATH: join(tempDir, "daemon.sock"),
     UBB_PORT: "0",
+    UBB_ANNOTATION_WEBHOOK_URL: undefined,
     UBB_DATA_DIR: tempDir
   };
 });
@@ -175,7 +176,7 @@ describe("CLI serve + mcp (real processes, no Chrome)", () => {
     await extension.connect(port, token);
     const client = await startMcpClient("annotation-client");
     const tools = (await client.listTools()).tools.map((tool) => tool.name);
-    expect(tools).toEqual(expect.arrayContaining(["annotations_list", "annotations_get", "annotations_resolve"]));
+    expect(tools).toEqual(expect.arrayContaining(["annotations_list", "annotations_get", "annotations_resolve", "annotations_reply"]));
     const tab = JSON.parse(textOf(await client.callTool({ name: "browser_new_tab", arguments: { url: annotationDraft.url } })));
     const saved = await extension.annotationRequest({ type: "annotationsSave", tabId: tab.id, annotation: annotationDraft, screenshot: annotationScreenshot });
     expect(saved.error).toBeUndefined();
@@ -188,10 +189,20 @@ describe("CLI serve + mcp (real processes, no Chrome)", () => {
     expect(JSON.parse((await annotationsCli(["get", "--url", annotationDraft.url])).stdout)).toEqual([item]);
     expect(JSON.parse(textOf(await client.callTool({ name: "annotations_get", arguments: { id: item.id } })))).toEqual(item);
     expect(JSON.parse(textOf(await client.callTool({ name: "annotations_get", arguments: { url: annotationDraft.url } })))).toEqual([item]);
+    const reply = await annotationsCli(["reply", item.id, "--text", "Working on it", "--author", "Hephaestus"]);
+    expect(reply.code).toBe(0);
+    expect(JSON.parse(reply.stdout)).toMatchObject({ status: "open", replies: [{ author: "Hephaestus", text: "Working on it" }] });
     const resolved = JSON.parse((await annotationsCli(["resolve", item.id, "--note", "Fixed via CLI"])).stdout);
     expect(resolved).toMatchObject({ status: "resolved", resolutionNote: "Fixed via CLI" });
     expect(JSON.parse(textOf(await client.callTool({ name: "annotations_list", arguments: { status: "resolved" } })))).toEqual([resolved]);
     expect((await client.callTool({ name: "annotations_resolve", arguments: { id: item.id } })).isError).toBeFalsy();
+    const confirmed = JSON.parse(textOf(await client.callTool({ name: "annotations_reply", arguments: { id: item.id, text: "Verified via MCP" } })));
+    expect(confirmed).toMatchObject({ status: "resolved", replies: [{ author: "Hephaestus" }, { author: "agent", text: "Verified via MCP" }] });
+    expect(JSON.parse((await annotationsCli(["get", item.id])).stdout)).toEqual(confirmed);
+    expect(JSON.parse((await annotationsCli(["webhook", "status"])).stdout)).toEqual({ configured: false, enabled: false, source: "none", host: null, headerNames: [] });
+    const webhookTest = await annotationsCli(["webhook", "test"]);
+    expect(webhookTest.code).toBe(1);
+    expect(JSON.parse(webhookTest.stdout)).toMatchObject({ ok: false, attempts: 0 });
     expect((await client.callTool({ name: "annotations_get", arguments: {} })).isError).toBe(true);
     const invalid = await annotationsCli(["list", "--status", "bad"]);
     expect(invalid.code).toBe(1);

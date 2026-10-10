@@ -7,6 +7,7 @@ import { DaemonServer } from "./daemon.js";
 import { DaemonClient } from "./daemon-client.js";
 import { runMcpServer } from "./mcp.js";
 import { parseAnnotationArgs } from "./annotation-cli.js";
+import type { WebhookResult } from "./annotation-webhook.js";
 
 const command = process.argv[2] ?? "help";
 const token = await getOrCreateToken();
@@ -46,7 +47,9 @@ if (command === "token") {
     const request = parseAnnotationArgs(process.argv.slice(3));
     client = new DaemonClient({ socketPath: daemonSocketPath(), token, clientId: randomUUID(), label: process.env.UBB_CLIENT_LABEL });
     await client.connect();
-    process.stdout.write(JSON.stringify(await client.request(request), null, 2) + "\n");
+    const result = await client.request(request);
+    process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+    if (request.action === "annotationsWebhookTest" && !(result as WebhookResult).ok) process.exitCode = 1;
   } catch (error) {
     process.stderr.write(`${(error as Error).message}\n`);
     process.exitCode = 1;
@@ -76,11 +79,14 @@ if (command === "token") {
       `  token  Print the extension pairing token\n\n` +
       `  annotations list [--url URL] [--status open|resolved|all] [--json]\n` +
       `  annotations get <id> | annotations get --url URL\n` +
-      `  annotations resolve <id> [--note TEXT]\n\n` +
+      `  annotations resolve <id> [--note TEXT]\n` +
+      `  annotations reply <id> --text TEXT [--author NAME]\n` +
+      `  annotations webhook status|test\n\n` +
       `Env vars:\n` +
       `  UBB_CLIENT_LABEL       Human-readable identity for this adapter (shown in approval prompts)\n` +
       `  UBB_SOCKET_PATH        Override the daemon control socket path\n` +
       `  UBB_DATA_DIR           Annotation data root (default ~/.universal-browser-bridge)\n` +
+      `  UBB_ANNOTATION_WEBHOOK_URL  Override and enable the annotation webhook (serve only)\n` +
       `  UBB_TOKEN_FILE         Override the pairing token file path\n` +
       `  UBB_PORT                Override the extension WebSocket port (serve only, default 17321)\n` +
       `  UBB_ALLOW_PRIVATE_NETWORKS  Allow navigation to localhost/private-network URLs\n`

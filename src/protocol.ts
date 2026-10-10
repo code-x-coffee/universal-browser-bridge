@@ -63,7 +63,10 @@ export type ControlAction =
   | "screenshot"
   | "annotationsList"
   | "annotationsGet"
-  | "annotationsResolve";
+  | "annotationsResolve"
+  | "annotationsReply"
+  | "annotationsWebhookStatus"
+  | "annotationsWebhookTest";
 
 export type ControlClientMessage =
   | { type: "hello"; token: string; clientId: string; label?: string; version: number }
@@ -82,6 +85,7 @@ export type ControlClientMessage =
       annotationId?: string;
       status?: AnnotationFilter["status"];
       note?: string;
+      author?: string;
     };
 
 export type ControlServerMessage =

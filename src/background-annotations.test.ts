@@ -9,6 +9,7 @@ class FakeSocket {
   static instance: FakeSocket;
   readyState = 1;
   messages: any[] = [];
+  annotations: any[] = [];
   listeners = new Map<string, (event?: any) => void>();
   constructor(_url: string) {
     FakeSocket.instance = this;
@@ -20,7 +21,7 @@ class FakeSocket {
     const message = JSON.parse(raw);
     this.messages.push(message);
     if (message.type === "hello") setTimeout(() => this.deliver({ type: "ready" }), 0);
-    if (message.type === "annotationsList") setTimeout(() => this.deliver({ type: "annotationsResponse", id: message.id, result: [] }), 0);
+    if (message.type === "annotationsList") setTimeout(() => this.deliver({ type: "annotationsResponse", id: message.id, result: this.annotations.filter((item) => item.url === message.url) }), 0);
     if (message.type === "annotationsSave") setTimeout(() => this.deliver({ type: "annotationsResponse", id: message.id, result: { ...message.annotation, id: "saved" } }), 0);
   }
   close() { this.readyState = 3; }
@@ -141,4 +142,21 @@ it("reports disconnection and rejects pending saves instead of leaving the popup
   mock.commandsOnCommand[0]!("toggle-annotate", tab);
   await settle();
   expect(mock.actionTitles.get(tab.id)).toMatch(/connect.*daemon/i);
+});
+
+it("refreshes reply threads on every shared tab at the same exact URL", async () => {
+  await share();
+  const matching = (await mock.chrome.windows.create({ url: tab.url, focused: false })).tabs[0]!;
+  const different = (await mock.chrome.windows.create({ url: tab.url + "?other", focused: false })).tabs[0]!;
+  for (const shared of [matching, different]) {
+    const sharing = mock.actionOnClicked[0]!(shared);
+    await settle(); await sharing;
+  }
+  const send = vi.spyOn(mock.chrome.tabs, "sendMessage");
+  const annotation = { ...annotationDraft, id: "saved", status: "open", replies: [{ id: "reply", author: "agent", text: "Fixed", createdAt: "2026-10-10T10:00:00.000Z" }] };
+  FakeSocket.instance.annotations = [annotation];
+  FakeSocket.instance.deliver({ type: "annotationUpdated", annotation });
+  await settle();
+  for (const id of [tab.id, matching.id]) expect(send).toHaveBeenCalledWith(id, { type: "ubbAnnotationsRender", url: tab.url, annotations: [annotation] });
+  expect(send.mock.calls.some(([id]) => id === different.id)).toBe(false);
 });

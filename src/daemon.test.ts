@@ -171,6 +171,10 @@ describe("DaemonServer + DaemonClient", () => {
     expect(await client.request({ action: "annotationsList", status: "open" })).toEqual([item]);
     expect(await client.request({ action: "annotationsGet", annotationId: item.id })).toEqual(item);
     expect(await client.request({ action: "annotationsGet", url: annotationDraft.url })).toEqual([item]);
+    const replied = await client.request({ action: "annotationsReply", annotationId: item.id, text: "Working on it", author: "Hephaestus" });
+    expect(replied).toMatchObject({ status: "open", replies: [{ text: "Working on it", author: "Hephaestus" }] });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(extension.updates).toContainEqual(replied);
     const resolved = await client.request({ action: "annotationsResolve", annotationId: item.id, note: "Done" });
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(extension.updates).toContainEqual(resolved);
@@ -179,6 +183,8 @@ describe("DaemonServer + DaemonClient", () => {
     extension.close();
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(await client.request({ action: "annotationsGet", annotationId: item.id })).toEqual(resolved);
+    const confirmed = await client.request({ action: "annotationsReply", annotationId: item.id, text: "Verified" });
+    expect(confirmed).toMatchObject({ status: "resolved", replies: [{ author: "Hephaestus" }, { author: "agent", text: "Verified" }] });
   });
 
   it("rejects extension annotation requests for unshared tabs and mismatched URLs", async () => {

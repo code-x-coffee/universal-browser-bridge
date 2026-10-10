@@ -1,8 +1,10 @@
 import { unlink } from "node:fs/promises";
+import { dirname } from "node:path";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import type { BrowserBridge } from "./bridge.js";
 import { tokensMatch } from "./auth.js";
 import { AnnotationStore } from "./annotations.js";
+import { AnnotationWebhook } from "./annotation-webhook.js";
 import { isPotentiallyConsequential } from "./policy.js";
 import { PROTOCOL_VERSION, type AnnotationExtensionRequest, type ControlClientMessage, type ControlServerMessage, type SharedTab } from "./protocol.js";
 import { clickDetailsScript, clickScript, describeKey, scrollScript, snapshotScript, typeScript } from "./dom-actions.js";
@@ -49,7 +51,8 @@ export class DaemonServer {
     private readonly bridge: BrowserBridge,
     private readonly token: string,
     private readonly socketPath: string,
-    private readonly annotations = new AnnotationStore()
+    private readonly annotations = new AnnotationStore(),
+    private readonly webhook: Pick<AnnotationWebhook, "created" | "status" | "test"> = new AnnotationWebhook({ dataRoot: dirname(annotations.directory) })
   ) {
     // Reconcile ownership/lease state for tabs that vanish out-of-band (the
     // user closes them directly in Chrome, or the extension disconnects).
@@ -82,7 +85,12 @@ export class DaemonServer {
         : await this.annotations.list({ url });
       this.bridge.sendAnnotations({ type: "annotationsResponse", id: message.id, result });
       if (message.type === "annotationsSave") {
-        this.bridge.sendAnnotations({ type: "annotationUpdated", annotation: result as Awaited<ReturnType<AnnotationStore["create"]>> });
+        const annotation = result as Awaited<ReturnType<AnnotationStore["create"]>>;
+        this.bridge.sendAnnotations({ type: "annotationUpdated", annotation });
+        // Detach delivery (including synchronous throws) from the committed save.
+        void Promise.resolve().then(() => this.webhook.created(annotation)).catch(() => {
+          process.stderr.write("Annotation webhook: delivery error\n");
+        });
       }
     } catch (error) {
       this.bridge.sendAnnotations({ type: "annotationsResponse", id: message.id, error: (error as Error).message });
@@ -232,6 +240,8 @@ export class DaemonServer {
     if (action === "status") return this.bridge.status();
     if (action === "listTabs") return this.bridge.command({ action: "listTabs" });
     if (action === "annotationsList") return this.annotations.list({ url: message.url, status: message.status });
+    if (action === "annotationsWebhookStatus") return this.webhook.status();
+    if (action === "annotationsWebhookTest") return this.webhook.test();
     if (action === "annotationsGet") {
       if (message.annotationId && message.url !== undefined) throw new Error("Specify an annotation ID or URL, not both");
       if (message.annotationId) return this.annotations.get(message.annotationId);
@@ -241,6 +251,12 @@ export class DaemonServer {
     if (action === "annotationsResolve") {
       if (!message.annotationId) throw new Error("annotationId is required");
       const annotation = await this.annotations.resolve(message.annotationId, message.note);
+      this.bridge.sendAnnotations({ type: "annotationUpdated", annotation });
+      return annotation;
+    }
+    if (action === "annotationsReply") {
+      if (!message.annotationId) throw new Error("annotationId is required");
+      const annotation = await this.annotations.reply(message.annotationId, { text: message.text!, author: message.author });
       this.bridge.sendAnnotations({ type: "annotationUpdated", annotation });
       return annotation;
     }
