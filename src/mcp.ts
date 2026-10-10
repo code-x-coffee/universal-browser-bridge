@@ -1,8 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { z } from "zod";
 import type { DaemonClient } from "./daemon-client.js";
 import { assertBrowserUrlAllowed } from "./url-policy.js";
+import { annotationIdSchema, annotationStatusSchema } from "./annotations.js";
 
 const httpUrl = z
   .string()
@@ -22,13 +24,32 @@ function text(value: unknown) {
   return { content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] };
 }
 
-export async function runMcpServer(bridge: DaemonClient): Promise<void> {
+export async function runMcpServer(bridge: DaemonClient, transport: Transport = new StdioServerTransport()): Promise<void> {
   const server = new McpServer({ name: "universal-browser-bridge", version: "0.1.0" });
 
   server.tool("browser_status", "Show extension connection and explicitly shared tabs.", {}, async () => text(await bridge.status()));
 
   server.tool("browser_tabs", "List only the Chrome tabs explicitly shared with agents.", {}, async () =>
     text(await bridge.request({ action: "listTabs" }))
+  );
+
+  server.tool(
+    "annotations_list",
+    "List saved page annotations, optionally filtered by exact URL and status. Includes absolute screenshot paths; works without Chrome connected.",
+    { url: z.string().optional(), status: annotationStatusSchema.optional() },
+    async ({ url, status }) => text(await bridge.request({ action: "annotationsList", url, status }))
+  );
+  server.tool(
+    "annotations_get",
+    "Get one annotation by ID, or all annotations for an exact URL. Supply exactly one of id or url. Includes absolute screenshotPath.",
+    { id: annotationIdSchema.optional(), url: z.string().optional() },
+    async ({ id, url }) => text(await bridge.request({ action: "annotationsGet", annotationId: id, url }))
+  );
+  server.tool(
+    "annotations_resolve",
+    "Resolve an annotation with an optional resolution note and update its pins on open shared tabs.",
+    { id: annotationIdSchema, note: z.string().max(10_000).optional() },
+    async ({ id, note }) => text(await bridge.request({ action: "annotationsResolve", annotationId: id, note }))
   );
 
   server.tool(
@@ -111,5 +132,5 @@ export async function runMcpServer(bridge: DaemonClient): Promise<void> {
     }
   );
 
-  await server.connect(new StdioServerTransport());
+  await server.connect(transport);
 }

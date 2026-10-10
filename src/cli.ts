@@ -6,6 +6,7 @@ import { daemonSocketPath } from "./daemon-socket.js";
 import { DaemonServer } from "./daemon.js";
 import { DaemonClient } from "./daemon-client.js";
 import { runMcpServer } from "./mcp.js";
+import { parseAnnotationArgs } from "./annotation-cli.js";
 
 const command = process.argv[2] ?? "help";
 const token = await getOrCreateToken();
@@ -39,6 +40,19 @@ if (command === "token") {
   };
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
+} else if (command === "annotations") {
+  let client: DaemonClient | undefined;
+  try {
+    const request = parseAnnotationArgs(process.argv.slice(3));
+    client = new DaemonClient({ socketPath: daemonSocketPath(), token, clientId: randomUUID(), label: process.env.UBB_CLIENT_LABEL });
+    await client.connect();
+    process.stdout.write(JSON.stringify(await client.request(request), null, 2) + "\n");
+  } catch (error) {
+    process.stderr.write(`${(error as Error).message}\n`);
+    process.exitCode = 1;
+  } finally {
+    await client?.close();
+  }
 } else if (command === "mcp") {
   const client = new DaemonClient({
     socketPath: daemonSocketPath(),
@@ -60,9 +74,13 @@ if (command === "token") {
       `  serve  Start the daemon: owns the Chrome extension connection and the control socket\n` +
       `  mcp    Connect to a running daemon and start the MCP stdio server for one adapter\n` +
       `  token  Print the extension pairing token\n\n` +
+      `  annotations list [--url URL] [--status open|resolved|all] [--json]\n` +
+      `  annotations get <id> | annotations get --url URL\n` +
+      `  annotations resolve <id> [--note TEXT]\n\n` +
       `Env vars:\n` +
       `  UBB_CLIENT_LABEL       Human-readable identity for this adapter (shown in approval prompts)\n` +
       `  UBB_SOCKET_PATH        Override the daemon control socket path\n` +
+      `  UBB_DATA_DIR           Annotation data root (default ~/.universal-browser-bridge)\n` +
       `  UBB_TOKEN_FILE         Override the pairing token file path\n` +
       `  UBB_PORT                Override the extension WebSocket port (serve only, default 17321)\n` +
       `  UBB_ALLOW_PRIVATE_NETWORKS  Allow navigation to localhost/private-network URLs\n`
