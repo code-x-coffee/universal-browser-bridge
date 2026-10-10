@@ -12,6 +12,9 @@ let keepaliveTimer;
 let intentionalDetach = new Set();
 const groupingInProgress = new Set();
 const revocationChecks = new Map();
+const pendingAnnotations = new Map();
+const tabGenerations = new Map();
+let authenticated = false;
 // Debounce window before acting on a possible group departure. Chrome
 // dispatches tabs.onUpdated/tabGroups.onUpdated over a channel that isn't
 // strictly ordered against the extension's own API-call promises, and event
@@ -28,6 +31,7 @@ async function settings() {
 }
 
 async function connect() {
+  authenticated = false;
   clearTimeout(reconnectTimer);
   const { relayUrl, token } = await settings();
   if (!token) {
@@ -35,29 +39,58 @@ async function connect() {
     return;
   }
   socket?.close();
-  socket = new WebSocket(relayUrl);
-  socket.addEventListener("open", () => {
-    socket.send(JSON.stringify({ type: "hello", token, version: PROTOCOL_VERSION }));
+  const connection = new WebSocket(relayUrl);
+  socket = connection;
+  connection.addEventListener("open", () => {
+    if (socket !== connection) return;
+    connection.send(JSON.stringify({ type: "hello", token, version: PROTOCOL_VERSION }));
     // Regular WebSocket traffic keeps the MV3 service worker alive (Chrome 116+
     // resets the 30s idle timer on each message).
     clearInterval(keepaliveTimer);
     keepaliveTimer = setInterval(() => send({ type: "ping" }), 20_000);
   });
-  socket.addEventListener("message", (event) => void handleMessage(JSON.parse(event.data)));
-  socket.addEventListener("close", () => {
+  connection.addEventListener("message", (event) => {
+    if (socket === connection) void handleMessage(JSON.parse(event.data));
+  });
+  connection.addEventListener("close", () => {
+    if (socket !== connection) return;
+    authenticated = false;
+    for (const pending of pendingAnnotations.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("Annotation daemon disconnected"));
+    }
+    pendingAnnotations.clear();
     clearInterval(keepaliveTimer);
     setGlobalBadge("!", "#b91c1c");
     reconnectTimer = setTimeout(connect, 2000);
   });
-  socket.addEventListener("error", () => socket.close());
+  connection.addEventListener("error", () => connection.close());
 }
 
 async function handleMessage(message) {
   if (message.type === "pong") return;
   if (message.type === "ready") {
+    authenticated = true;
     setGlobalBadge("", "#0891b2");
     await restoreSharedTabs();
     await sendTabs();
+    for (const tabId of sharedTabs) void refreshAnnotations(tabId).catch(() => {});
+    return;
+  }
+  if (message.type === "annotationsResponse") {
+    const pending = pendingAnnotations.get(message.id);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    pendingAnnotations.delete(message.id);
+    if (message.error) pending.reject(new Error(message.error));
+    else pending.resolve(message.result);
+    return;
+  }
+  if (message.type === "annotationUpdated") {
+    for (const tabId of sharedTabs) {
+      const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+      if (tab?.url === message.annotation.url) void refreshAnnotations(tabId).catch(() => {});
+    }
     return;
   }
   if (message.type !== "command") return;
@@ -101,6 +134,7 @@ async function shareTab(tabId) {
     await chrome.action.setBadgeBackgroundColor({ tabId, color: "#0891b2" });
     await chrome.action.setTitle({ tabId, title: DEFAULT_ACTION_TITLE }).catch(() => {});
     await sendTabs();
+    void refreshAnnotations(tabId).catch(() => {});
   } catch (error) {
     sharedTabs.delete(tabId);
     await chrome.storage.session.set({ sharedTabIds: [...sharedTabs] }).catch(() => {});
@@ -116,6 +150,7 @@ async function shareTab(tabId) {
 async function unshareTab(tabId, { ungroup = true } = {}) {
   if (!sharedTabs.has(tabId)) return;
   sharedTabs.delete(tabId);
+  await chrome.tabs.sendMessage(tabId, { type: "ubbAnnotationsDestroy" }).catch(() => {});
   intentionalDetach.add(tabId);
   await chrome.debugger.detach({ tabId }).catch(() => {});
   intentionalDetach.delete(tabId);
@@ -295,6 +330,97 @@ function send(message) {
   if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
 }
 
+function annotationRequest(body) {
+  if (!authenticated || socket?.readyState !== WebSocket.OPEN) return Promise.reject(new Error("Annotation daemon is not connected"));
+  const id = crypto.randomUUID();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingAnnotations.delete(id);
+      reject(new Error("Annotation request timed out"));
+    }, 20_000);
+    pendingAnnotations.set(id, { resolve, reject, timer });
+    send({ ...body, id });
+  });
+}
+
+async function injectAnnotations(tabId) {
+  if (!sharedTabs.has(tabId)) throw new Error("Share this tab before annotating it");
+  await chrome.scripting.executeScript({ target: { tabId }, files: ["annotation-utils.js", "annotations.js"] });
+  if (!sharedTabs.has(tabId)) {
+    await chrome.tabs.sendMessage(tabId, { type: "ubbAnnotationsDestroy" }).catch(() => {});
+    throw new Error("Tab is no longer shared");
+  }
+}
+
+async function refreshAnnotations(tabId) {
+  if (!authenticated || !sharedTabs.has(tabId)) return;
+  const tab = await chrome.tabs.get(tabId);
+  const generation = tabGenerations.get(tabId);
+  await injectAnnotations(tabId);
+  // Keep the daemon's shared URL current before the URL-scoped request.
+  await sendTabs();
+  const annotations = await annotationRequest({ type: "annotationsList", tabId, url: tab.url });
+  if (!sharedTabs.has(tabId) || generation !== tabGenerations.get(tabId)) return;
+  const current = await chrome.tabs.get(tabId);
+  if (current.url !== tab.url) return;
+  await chrome.tabs.sendMessage(tabId, { type: "ubbAnnotationsRender", url: tab.url, annotations });
+}
+
+async function toggleAnnotations(tabId) {
+  try {
+    if (!sharedTabs.has(tabId)) throw new Error("Share this tab with the toolbar icon before annotating it");
+    if (!authenticated) throw new Error("Connect the annotation daemon before annotating this tab");
+    await injectAnnotations(tabId);
+    await chrome.tabs.sendMessage(tabId, { type: "ubbAnnotationsToggle" });
+    await chrome.action.setTitle({ tabId, title: DEFAULT_ACTION_TITLE }).catch(() => {});
+    void refreshAnnotations(tabId).catch(() => {});
+  } catch (error) {
+    console.warn("Annotations unavailable:", error.message || String(error));
+    await chrome.action.setTitle({ tabId, title: error.message || String(error) }).catch(() => {});
+  }
+}
+
+async function saveAnnotation(message, sender) {
+  const tabId = sender.tab?.id;
+  if (!tabId || sender.frameId !== 0 || !sharedTabs.has(tabId)) throw new Error("Annotations require a shared top-level tab");
+  const tab = await chrome.tabs.get(tabId);
+  const generation = tabGenerations.get(tabId);
+  const url = message.annotation?.url;
+  const assertCurrent = async () => {
+    const current = await chrome.tabs.get(tabId);
+    const active = await chrome.tabs.query({ windowId: tab.windowId, active: true });
+    if (!sharedTabs.has(tabId) || current.status === "loading" || current.url !== url || sender.url !== url || generation !== tabGenerations.get(tabId) || active[0]?.id !== tabId) {
+      throw new Error("Keep the shared annotation tab active at the same URL while saving");
+    }
+    if (sender.documentId) {
+      const context = await chrome.tabs.sendMessage(tabId, { type: "ubbAnnotationsCaptureContext" }, { documentId: sender.documentId });
+      if (context?.url !== url || !context.hidden || context.scroll?.x !== message.annotation.scroll?.x || context.scroll?.y !== message.annotation.scroll?.y) {
+        throw new Error("The page or scroll position changed during annotation capture; retry Save");
+      }
+    }
+  };
+  await assertCurrent();
+  const screenshot = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+  await assertCurrent();
+  await sendTabs();
+  return annotationRequest({ type: "annotationsSave", tabId, annotation: { ...message.annotation, title: tab.title || "" }, screenshot });
+}
+
+chrome.commands.onCommand.addListener((command, tab) => {
+  if (command !== "toggle-annotate") return;
+  if (tab?.id) void toggleAnnotations(tab.id);
+  else void chrome.tabs.query({ active: true, currentWindow: true }).then(([active]) => {
+    if (active?.id) void toggleAnnotations(active.id);
+  });
+});
+
+void chrome.contextMenus.remove("ubb-annotate").catch(() => {}).then(() => {
+  chrome.contextMenus.create({ id: "ubb-annotate", title: "Annotate this tab", contexts: ["action"] });
+});
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (info.menuItemId === "ubb-annotate" && tab?.id) void toggleAnnotations(tab.id);
+});
+
 function setGlobalBadge(text, color) {
   chrome.action.setBadgeText({ text });
   chrome.action.setBadgeBackgroundColor({ color });
@@ -329,12 +455,14 @@ chrome.action.onClicked.addListener(async (tab) => {
 chrome.debugger.onDetach.addListener(({ tabId }) => {
   if (intentionalDetach.has(tabId)) return;
   sharedTabs.delete(tabId);
+  void chrome.tabs.sendMessage(tabId, { type: "ubbAnnotationsDestroy" }).catch(() => {});
   chrome.storage.session.set({ sharedTabIds: [...sharedTabs] });
   chrome.action.setBadgeText({ tabId, text: "" }).catch(() => {});
   void sendTabs();
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  tabGenerations.delete(tabId);
   sharedTabs.delete(tabId);
   agentTabs.delete(tabId);
   chrome.storage.session.set({ sharedTabIds: [...sharedTabs] });
@@ -343,6 +471,10 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === "loading" || changeInfo.url) tabGenerations.set(tabId, (tabGenerations.get(tabId) || 0) + 1);
+  if (sharedTabs.has(tabId) && (changeInfo.status === "complete" || changeInfo.url)) {
+    void refreshAnnotations(tabId).catch(() => {});
+  }
   if (!sharedTabs.has(tabId) || changeInfo.groupId === undefined || groupingInProgress.has(tabId)) return;
   scheduleRevocationCheck(tabId);
 });
@@ -368,7 +500,14 @@ chrome.windows.onRemoved.addListener((windowId) => {
   });
 });
 
-chrome.runtime.onMessage.addListener((message) => {
+chrome.runtime.onMessage.addListener((message, sender, respond) => {
+  if (message?.type === "ubbAnnotationSave") {
+    void saveAnnotation(message, sender).then((result) => respond({ result }), (error) => respond({ error: error.message || String(error) }));
+    return true;
+  }
+  if (message?.type === "ubbAnnotationsReload" && sender.tab?.id && sender.frameId === 0 && sharedTabs.has(sender.tab.id)) {
+    void refreshAnnotations(sender.tab.id).catch(() => {});
+  }
   if (message?.type === "approvalDecision" && typeof message.id === "string") {
     finishApproval(message.id, message.approved === true);
   }

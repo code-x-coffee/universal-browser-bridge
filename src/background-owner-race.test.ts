@@ -22,6 +22,7 @@ import { WebSocket as WSImpl } from "ws";
 import { BrowserBridge } from "./bridge.js";
 import { DaemonClient } from "./daemon-client.js";
 import { DaemonServer } from "./daemon.js";
+import { AnnotationStore } from "./annotations.js";
 import { createChromeMock } from "./test-support/chrome-mock.js";
 
 const TOKEN = "background-race-test-token";
@@ -78,7 +79,7 @@ it("does not let another client close a tab that the extension's own group/title
   await bridge.start();
 
   const socketPath = join(tempDir, "daemon.sock");
-  daemon = new DaemonServer(bridge, TOKEN, socketPath);
+  daemon = new DaemonServer(bridge, TOKEN, socketPath, new AnnotationStore(join(tempDir, "annotations")));
   await daemon.start();
 
   // background.js's top-level `restoreAgentTabs().then(connect)` reads
@@ -120,7 +121,7 @@ it("still revokes sharing when a human later renames the tab's group away from A
   await bridge.start();
 
   const socketPath = join(tempDir, "daemon.sock");
-  daemon = new DaemonServer(bridge, TOKEN, socketPath);
+  daemon = new DaemonServer(bridge, TOKEN, socketPath, new AnnotationStore(join(tempDir, "annotations")));
   await daemon.start();
 
   await chrome.storage.local.set({ relayUrl: `ws://127.0.0.1:${bridge.port}/extension`, token: TOKEN });
@@ -173,7 +174,7 @@ it("does not self-unshare when the group-creation event is delivered after ensur
   await bridge.start();
 
   const socketPath = join(tempDir, "daemon.sock");
-  daemon = new DaemonServer(bridge, TOKEN, socketPath);
+  daemon = new DaemonServer(bridge, TOKEN, socketPath, new AnnotationStore(join(tempDir, "annotations")));
   await daemon.start();
 
   await chrome.storage.local.set({ relayUrl: `ws://127.0.0.1:${bridge.port}/extension`, token: TOKEN });
