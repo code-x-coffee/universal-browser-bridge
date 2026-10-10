@@ -191,11 +191,11 @@ Chrome internal pages, extension pages, password-manager prompts, passkeys, nati
 
 Share a normal HTTP(S) tab with the toolbar icon, then enter annotation mode with **Alt+Shift+A** (macOS: **Control+Shift+A**) or right-click the toolbar icon and choose **Annotate this tab**. The toolbar's normal click still toggles sharing. If the shortcut conflicts, change it at `chrome://extensions/shortcuts`.
 
-Hover to highlight an element, click to select it, or drag a rectangle. Enter a comment and click **Save**. **Cancel** discards the selection; **Esc** cancels the popup and exits annotation mode. Numbered pins show comments on hover or click. Resolved pins turn grey, and updates appear on every shared tab at the same exact URL. Reloading that URL restores its pins.
+Hover to highlight an element, click to select it, or drag a rectangle. Enter a comment and click **Save**. **Cancel** discards the selection; **Esc** cancels the popup and exits annotation mode. Numbered pins show comments and reply threads on hover or click. Open pins with replies turn green, gain a badge dot, and have an **Answered** title and accessible label. Resolved pins stay grey even when they have replies. Updates appear on every shared tab at the same exact URL. Reloading that URL restores its pins. Long threads scroll; reply authors and local timestamps appear above plain-text replies.
 
 Each save captures a PNG of the visible viewport with the annotation overlay hidden. Keep that tab active in its window until saving finishes. Metadata includes the selector, a short text snippet, page rectangle, viewport, scroll position, URL, title and timestamps. Pins follow the selector when it still exists, including the region's saved offset from its anchor; otherwise they use the original page coordinates.
 
-The daemon stores private files in `~/.universal-browser-bridge/annotations/`: `annotations.json` and `<id>.png`. Set `UBB_DATA_DIR` on **serve** to change the data root. The daemon is the sole writer and commits files with temporary-file renames. Annotation queries and resolution also work when Chrome is disconnected.
+The daemon stores private files in `~/.universal-browser-bridge/annotations/`: `annotations.json` and `<id>.png`. Set `UBB_DATA_DIR` on **serve** to change the data root. The daemon is the sole writer and commits files with temporary-file renames. Annotation queries, resolution and replies also work when Chrome is disconnected.
 
 ```bash
 universal-browser-bridge annotations list --status open --json
@@ -203,9 +203,12 @@ universal-browser-bridge annotations list --url 'https://example.com/'
 universal-browser-bridge annotations get <id>
 universal-browser-bridge annotations get --url 'https://example.com/'
 universal-browser-bridge annotations resolve <id> --note 'Fixed the heading'
+universal-browser-bridge annotations reply <id> --text 'Fixed the spacing' --author Hephaestus
 ```
 
 CLI output is JSON. List defaults to all statuses; URL filters match exactly, including query strings and fragments. `get <id>` returns one record, and `get --url` returns an array. Both include an absolute `screenshotPath`. Resolution is idempotent and preserves the first resolution timestamp and note.
+
+Every record includes `replies`, an array of `{id, author, text, createdAt}`. Older records load with an empty array. Reply text is trimmed and must contain 1–10,000 characters. Authors are trimmed and must contain 1–100 characters; omitted authors default to `agent`. Replying to a resolved annotation preserves its resolved state. `annotations reply` prints the updated record.
 
 MCP provides the same operations. For an existing `ubb <tool_name> '<json>'` wrapper:
 
@@ -214,11 +217,58 @@ ubb annotations_list '{"status":"open","url":"https://example.com/"}'
 ubb annotations_get '{"id":"<id>"}'
 ubb annotations_get '{"url":"https://example.com/"}'
 ubb annotations_resolve '{"id":"<id>","note":"Fixed the heading"}'
+ubb annotations_reply '{"id":"<id>","text":"Fixed the spacing","author":"Hephaestus"}'
 ```
 
 Annotations use the existing token-authenticated WebSocket and control socket, with no additional listener. The extension adds `scripting`, `contextMenus` and `activeTab`, with no broad website host permission. Chrome grants `activeTab` on a toolbar click, annotation shortcut or context-menu invocation; automatic injection still requires the tab to be shared. Same-origin reloads retain the grant. After crossing origins, or on an agent-created tab without a user gesture, invoke the annotation shortcut or context menu again to grant access. Unsharing removes the overlay.
 
-V1 annotations target the top-level document. Iframes and elements inside shadow roots cannot be individually selected. Screenshots show only the viewport; coordinates and selectors may become less accurate after major page changes. Data remains local until an agent reads it through the bridge.
+Annotations target the top-level document. Iframes and elements inside shadow roots cannot be individually selected. Screenshots show only the viewport; coordinates and selectors may become less accurate after major page changes. Data remains local until an agent reads it through the bridge or you enable a webhook.
+
+### Annotation webhook
+
+To POST each newly saved annotation to an HTTP(S) endpoint, create `<dataRoot>/webhook.json`. The data root is `UBB_DATA_DIR` on **serve**, or `~/.universal-browser-bridge` by default:
+
+```json
+{
+  "url": "https://hooks.example.com/annotations",
+  "headers": {
+    "Authorization": "Bearer YOUR_TOKEN",
+    "X-Sender-Key": "YOUR_SENDER_KEY"
+  },
+  "enabled": true
+}
+```
+
+Keep the directory private (mode `700`) and the config file private (mode `600`, for example `chmod 600 ~/.universal-browser-bridge/webhook.json`). The CLI does not write this file. `headers` defaults to `{}` and `enabled` defaults to `true`. Set `enabled: false` to disable delivery. Set `UBB_ANNOTATION_WEBHOOK_URL` on **serve** to override the URL and enable delivery, including without a file; valid file headers still apply. File edits are read on the next send without restarting the daemon. A missing file with no override is silently disabled. Invalid JSON/configuration disables delivery, even with an env override, and emits one warning until the configuration becomes valid again.
+
+Each successful new save sends this JSON metadata, never PNG bytes:
+
+```json
+{
+  "event": "annotation.created",
+  "annotation": {
+    "id": "00000000-0000-4000-8000-000000000001",
+    "comment": "Fix the heading",
+    "url": "https://example.com/",
+    "title": "Example",
+    "textSnippet": "Page heading",
+    "selector": "#heading",
+    "createdAt": "2026-10-10T10:00:00.000Z",
+    "screenshotPath": "/absolute/data/root/annotations/00000000-0000-4000-8000-000000000001.png"
+  }
+}
+```
+
+Requests always use `Content-Type: application/json`. `User-Agent: universal-browser-bridge` is added unless overridden (header names are case-insensitive). Delivery runs asynchronously after saving and never delays or fails the extension's save response. Queries, replies and resolutions do not send webhooks.
+
+Each attempt has a 10-second timeout. Network failures, timeouts, HTTP `429` and `5xx` retry up to three times, with 1s, 2s and 4s backoff (four attempts total, about 47 seconds maximum). Other HTTP errors do not retry, and redirects are not followed. Failures log only the endpoint host and HTTP status or a generic error, never header values or URL paths/queries. Retries can deliver the same event more than once; consumers should deduplicate by annotation ID. Delivery is best-effort in memory, with no durable queue or restart recovery.
+
+```bash
+universal-browser-bridge annotations webhook status
+universal-browser-bridge annotations webhook test
+```
+
+Both commands use the authenticated daemon control socket, so **serve** must be running. `status` prints `{configured, enabled, source, host, headerNames}` with source `file`, `env` or `none`, and never prints header values. `test` uses the same sender, headers, timeout and retry policy to send `{"event":"annotation.test","sentAt":"<ISO timestamp>"}`. It prints `{ok, attempts}` plus a status code or error, and exits non-zero for disabled configuration or failed delivery.
 
 **After updating, reload the extension at `chrome://extensions` and rebuild/restart the daemon and MCP adapters.** Live annotation interaction in Chrome is a separate manual check from the automated mock, socket and process tests.
 
@@ -240,6 +290,7 @@ V1 annotations target the top-level document. Iframes and elements inside shadow
 | `annotations_list` | List saved annotations by exact URL and status |
 | `annotations_get` | Get an annotation by ID or all annotations for a URL |
 | `annotations_resolve` | Resolve an annotation and update live pins |
+| `annotations_reply` | Append a reply and update live pins, including on resolved annotations |
 
 `browser_click` and `browser_type` require both the element `ref` and `snapshotId` returned by `browser_snapshot`. Take another snapshot after navigating.
 
@@ -286,6 +337,7 @@ Cross-compile by selecting a Bun target such as `bun-linux-x64`, `bun-windows-x6
 | `UBB_TOKEN` | `serve`, `mcp`, `token`, `annotations` | Supply the token directly instead of reading a file |
 | `UBB_SOCKET_PATH` | `serve`, `mcp`, `annotations` | Control socket path; defaults to `~/.universal-browser-bridge/daemon.sock` or a Windows named pipe |
 | `UBB_DATA_DIR` | `serve` | Annotation data root; defaults to `~/.universal-browser-bridge` |
+| `UBB_ANNOTATION_WEBHOOK_URL` | `serve` | Override and enable the annotation webhook URL; retain valid file headers |
 | `UBB_PORT` | `serve` | Extension WebSocket port; defaults to `17321` |
 | `UBB_CLIENT_LABEL` | `mcp` | Human-readable adapter identity shown in approvals and errors |
 | `UBB_ALLOW_PRIVATE_NETWORKS` | `mcp` | Set to `1` to allow localhost and private-network navigation |
