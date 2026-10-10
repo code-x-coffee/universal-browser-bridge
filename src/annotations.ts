@@ -18,6 +18,12 @@ export const annotationDraftSchema = z.object({
 });
 export const annotationStatusSchema = z.enum(["open", "resolved", "all"]);
 export const annotationIdSchema = z.string().uuid();
+export const annotationReplySchema = z.object({
+  text: z.string().trim().min(1).max(10_000),
+  author: z.string().trim().min(1).max(100).default("agent")
+});
+const savedReplySchema = annotationReplySchema.extend({ id: annotationIdSchema, createdAt: z.string().datetime() });
+export type AnnotationReply = z.infer<typeof savedReplySchema>;
 export type AnnotationDraft = z.infer<typeof annotationDraftSchema>;
 export type Annotation = AnnotationDraft & {
   id: string;
@@ -26,11 +32,16 @@ export type Annotation = AnnotationDraft & {
   resolvedAt?: string;
   resolutionNote?: string;
   screenshotPath: string;
+  replies: AnnotationReply[];
 };
 export type AnnotationFilter = { url?: string; status?: "open" | "resolved" | "all" };
 
+export function annotationDataRoot(): string {
+  return process.env.UBB_DATA_DIR ? resolve(process.env.UBB_DATA_DIR) : join(homedir(), ".universal-browser-bridge");
+}
+
 export function annotationDirectory(): string {
-  return join(process.env.UBB_DATA_DIR ? resolve(process.env.UBB_DATA_DIR) : join(homedir(), ".universal-browser-bridge"), "annotations");
+  return join(annotationDataRoot(), "annotations");
 }
 
 const savedAnnotationSchema = annotationDraftSchema.extend({
@@ -39,11 +50,12 @@ const savedAnnotationSchema = annotationDraftSchema.extend({
   status: z.enum(["open", "resolved"]),
   resolvedAt: z.string().datetime().optional(),
   resolutionNote: z.string().max(10_000).optional(),
-  screenshotPath: z.string()
+  screenshotPath: z.string(),
+  replies: savedReplySchema.array().default([])
 });
 
 // The daemon is the sole writer. Serialize mutations so concurrent saves and
-// resolutions never overwrite one another, and publish state only after rename.
+// replies/resolutions never overwrite one another; publish only after rename.
 export class AnnotationStore {
   readonly directory: string;
   private records?: Annotation[];
@@ -91,7 +103,7 @@ export class AnnotationStore {
     return this.mutate(async () => {
       const records = await this.load();
       const id = randomUUID();
-      const record: Annotation = { ...data, id, createdAt: new Date().toISOString(), status: "open", screenshotPath: join(this.directory, `${id}.png`) };
+      const record: Annotation = { ...data, id, createdAt: new Date().toISOString(), status: "open", screenshotPath: join(this.directory, `${id}.png`), replies: [] };
       await this.atomicWrite(record.screenshotPath, png);
       const next = [...records, record];
       try {
@@ -128,6 +140,22 @@ export class AnnotationStore {
       if (!record) throw new Error(`Annotation not found: ${id}`);
       if (record.status === "resolved") return structuredClone(record);
       const updated: Annotation = { ...record, status: "resolved", resolvedAt: new Date().toISOString(), ...(note === undefined ? {} : { resolutionNote: note }) };
+      const next = records.map((item) => item.id === id ? updated : item);
+      await this.atomicWrite(join(this.directory, "annotations.json"), JSON.stringify(next, null, 2) + "\n");
+      this.records = next;
+      return structuredClone(updated);
+    });
+  }
+
+  async reply(id: string, input: { text: string; author?: string }): Promise<Annotation> {
+    annotationIdSchema.parse(id);
+    const data = annotationReplySchema.parse(input);
+    return this.mutate(async () => {
+      const records = await this.load();
+      const record = records.find((record) => record.id === id);
+      if (!record) throw new Error(`Annotation not found: ${id}`);
+      const reply: AnnotationReply = { ...data, id: randomUUID(), createdAt: new Date().toISOString() };
+      const updated: Annotation = { ...record, replies: [...record.replies, reply] };
       const next = records.map((item) => item.id === id ? updated : item);
       await this.atomicWrite(join(this.directory, "annotations.json"), JSON.stringify(next, null, 2) + "\n");
       this.records = next;
