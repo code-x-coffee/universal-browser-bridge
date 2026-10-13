@@ -6,6 +6,7 @@ export type SharedTab = {
   id: number;
   title: string;
   url: string;
+  pendingUrl?: string;
   active: boolean;
   ownerLabel?: string;
   groupId?: number;
@@ -14,7 +15,8 @@ export type SharedTab = {
 export type AgentTab = { tabId: number; url: string; title: string; groupId: number };
 
 export type ExtensionMessage =
-  | { type: "hello"; token: string; version: number }
+  | { type: "hello"; token: string; version: number; blockedDomains?: string[] }
+  | { type: "sitePolicy"; blockedDomains: string[] }
   | { type: "tabs"; tabs: SharedTab[] }
   | { type: "response"; id: string; result?: unknown; error?: string }
   | { type: "event"; tabId: number; method: string; params: unknown }

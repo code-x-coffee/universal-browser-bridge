@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import { WebSocketServer, WebSocket } from "ws";
 import { PROTOCOL_VERSION, type AnnotationExtensionMessage, type BridgeCommand, type BridgeStatus, type ExtensionMessage, type SharedTab } from "./protocol.js";
 import { tokensMatch } from "./auth.js";
+import { normalizeBlockedDomains } from "./url-policy.js";
 
 type Pending = { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout };
 
@@ -16,6 +17,7 @@ export class BrowserBridge extends EventEmitter {
   private pending = new Map<string, Pending>();
   private server?: ReturnType<typeof createServer>;
   private boundPort = 0;
+  private siteBlocklist: string[] = [];
 
   constructor(
     private readonly token: string,
@@ -27,6 +29,10 @@ export class BrowserBridge extends EventEmitter {
 
   get port(): number {
     return this.boundPort;
+  }
+
+  get blockedDomains(): readonly string[] {
+    return this.siteBlocklist;
   }
 
   async start(): Promise<void> {
@@ -108,6 +114,12 @@ export class BrowserBridge extends EventEmitter {
           return;
         }
         authenticated = true;
+        try {
+          this.siteBlocklist = normalizeBlockedDomains(message.blockedDomains ?? []);
+        } catch {
+          ws.close(4400, "Invalid site policy");
+          return;
+        }
         clearTimeout(authTimer);
         this.extension?.close(4409, "Replaced by a newer extension connection");
         this.extension = ws;
@@ -118,6 +130,14 @@ export class BrowserBridge extends EventEmitter {
 
       // A replaced authenticated peer must not mutate the current session.
       if (this.extension !== ws) return;
+      if (message.type === "sitePolicy") {
+        try {
+          this.siteBlocklist = normalizeBlockedDomains(message.blockedDomains);
+        } catch {
+          ws.close(4400, "Invalid site policy");
+        }
+        return;
+      }
       if (message.type === "annotationsSave" || message.type === "annotationsList") {
         this.emit("annotations", message);
         return;

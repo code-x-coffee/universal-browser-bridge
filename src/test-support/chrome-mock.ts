@@ -25,7 +25,7 @@ function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-type MockTab = { id: number; windowId: number; url: string; title: string; active: boolean; groupId: number };
+type MockTab = { id: number; windowId: number; url: string; pendingUrl?: string; title: string; active: boolean; groupId: number };
 type MockGroup = { id: number; title: string; color: string; collapsed: boolean; windowId: number };
 
 export function createChromeMock(options: { delays?: ChromeMockDelays } = {}) {
@@ -51,6 +51,7 @@ export function createChromeMock(options: { delays?: ChromeMockDelays } = {}) {
 
   const sessionStore = new Map<string, unknown>();
   const localStore = new Map<string, unknown>();
+  const storageOnChanged: Array<(changes: Record<string, { oldValue?: unknown; newValue?: unknown }>, area: string) => void> = [];
 
   // chrome.storage.*.get accepts a string key, an array of keys, or an
   // object of {key: defaultValue} -- background.js uses all three forms.
@@ -79,7 +80,12 @@ export function createChromeMock(options: { delays?: ChromeMockDelays } = {}) {
       local: {
         get: async (query: unknown) => readStorage(localStore, query),
         set: async (obj: Record<string, unknown>) => {
-          for (const [k, v] of Object.entries(obj)) localStore.set(k, v);
+          const changes: Record<string, { oldValue?: unknown; newValue?: unknown }> = {};
+          for (const [k, v] of Object.entries(obj)) {
+            changes[k] = { oldValue: localStore.get(k), newValue: v };
+            localStore.set(k, v);
+          }
+          for (const listener of storageOnChanged) listener(changes, "local");
         }
       },
       session: {
@@ -91,7 +97,7 @@ export function createChromeMock(options: { delays?: ChromeMockDelays } = {}) {
           sessionStore.delete(key);
         }
       },
-      onChanged: { addListener: () => {} }
+      onChanged: { addListener: (fn: (typeof storageOnChanged)[number]) => storageOnChanged.push(fn) }
     },
     windows: {
       get: async (id: number) => {
@@ -248,7 +254,7 @@ export function createChromeMock(options: { delays?: ChromeMockDelays } = {}) {
   // storage survive. Re-evaluate background.js after this to test restoration.
   function resetWorkerListeners(): void {
     for (const listeners of [tabsOnUpdated, tabsOnRemoved, tabGroupsOnUpdated, actionOnClicked,
-      debuggerOnDetach, commandsOnCommand, contextMenusOnClicked, runtimeOnMessage]) listeners.length = 0;
+      debuggerOnDetach, commandsOnCommand, contextMenusOnClicked, runtimeOnMessage, storageOnChanged]) listeners.length = 0;
   }
 
   return { chrome, simulateGroupRename, resetWorkerListeners, actionOnClicked, debuggerOnDetach, actionTitles, commandsOnCommand, contextMenusOnClicked, runtimeOnMessage, tabsOnUpdated, tabsById };

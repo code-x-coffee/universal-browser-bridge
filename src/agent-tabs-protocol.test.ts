@@ -162,8 +162,9 @@ it("advertises owned-tab tools over MCP and accepts owned IDs in every browser t
   expect(data(await owner.callTool({ name: "browser_close_tab", arguments: { tabId: tab.id } }))).toEqual({ closed: tab.id });
 });
 
-it.each(["https://netbanking.hdfcbank.com/", "https://checkout.stripe.com/session", "https://example.com/checkout"])(
-  "keeps an initial bank/payment URL read-only: %s", async (url) => {
+it.each(["https://netbanking.hdfcbank.com/", "https://checkout.stripe.com/session", "https://example.com/checkout",
+  "https://vault.bitwarden.com/", "https://passwords.google.com/", "https://proton.me/pass", "https://americanexpress.com/"])(
+  "keeps an initial sensitive URL read-only even with owned-tab trust on: %s", async (url) => {
     const owner = control("Hephaestus");
     const tab = await create(owner, url);
     const snapshot = (await request(owner, { action: "snapshot", tabId: tab.id })).result;
@@ -188,9 +189,25 @@ it.each(["https://netbanking.hdfcbank.com/", "https://checkout.stripe.com/sessio
 );
 
 it.each([
+  { action: "click", setting: undefined }, { action: "press", setting: undefined },
+  { action: "click", setting: true }, { action: "press", setting: true }
+])("trusts an owned-tab $action without opening an approval popup (setting=$setting)", async ({ action, setting }) => {
+  if (setting !== undefined) await mock.chrome.storage.local.set({ trustAgentOwnedTabs: setting });
+  const owner = control("Hephaestus");
+  const tab = await create(owner);
+  const snapshot = (await request(owner, { action: "snapshot", tabId: tab.id })).result;
+  const windows = vi.spyOn(mock.chrome.windows, "create");
+  const response = await request(owner, { action, tabId: tab.id, snapshotId: snapshot.snapshotId,
+    ref: "ubb-0", description: "Submit order", key: "Enter", trustAgentOwnedTabs: false });
+  expect(response.error).toBeUndefined();
+  expect(windows).not.toHaveBeenCalled();
+});
+
+it.each([
   { action: "click", approved: false }, { action: "click", approved: true },
   { action: "press", approved: false }, { action: "press", approved: true }
-])("requires Chrome approval for an owned-tab $action (approved=$approved)", async ({ action, approved }) => {
+])("requires Chrome approval with owned-tab trust off for $action (approved=$approved)", async ({ action, approved }) => {
+  await mock.chrome.storage.local.set({ trustAgentOwnedTabs: false });
   const owner = control("Hephaestus");
   const tab = await create(owner);
   const snapshot = (await request(owner, { action: "snapshot", tabId: tab.id })).result;
@@ -199,7 +216,7 @@ it.each([
   commands.mockClear();
   const id = randomUUID();
   owner.emit("data", Buffer.from(JSON.stringify({ type: "request", id, action, tabId: tab.id,
-    snapshotId: snapshot.snapshotId, ref: "ubb-0", description: "Open details", key: "Enter" }) + "\n"));
+    snapshotId: snapshot.snapshotId, ref: "ubb-0", description: "Open details", key: "Enter", trustAgentOwnedTabs: true }) + "\n"));
   await settle();
   const mutations = () => commands.mock.calls.filter(([, method, params]) => method === "Input.dispatchKeyEvent" || String(params.expression).includes("el.click()"));
   expect(mutations()).toEqual([]);
@@ -220,7 +237,8 @@ it.each([
   }
 });
 
-it.each(["bank-redirect", "ungroup"])("rechecks safety after approval when the user causes a %s", async (change) => {
+it.each(["bank-redirect", "ungroup", "blocklist-change", "blocked-redirect"])("rechecks safety after approval when the user causes a %s", async (change) => {
+  await mock.chrome.storage.local.set({ trustAgentOwnedTabs: false });
   const owner = control("Hephaestus");
   const tab = await create(owner);
   const windows = vi.spyOn(mock.chrome.windows, "create");
@@ -232,11 +250,61 @@ it.each(["bank-redirect", "ungroup"])("rechecks safety after approval when the u
   const popup = windows.mock.calls.find(([options]) => options.url.includes("approval.html"))![0];
   const approvalId = new URL(popup.url).searchParams.get("id")!;
   if (change === "bank-redirect") mock.tabsById.get(tab.id)!.url = "https://netbanking.hdfcbank.com/";
-  else await mock.chrome.tabs.ungroup(tab.id);
+  if (change === "ungroup") await mock.chrome.tabs.ungroup(tab.id);
+  if (change === "blocklist-change") await mock.chrome.storage.local.set({ blockedDomains: ["example.com"] });
+  if (change === "blocked-redirect") {
+    await mock.chrome.storage.local.set({ blockedDomains: ["example.org"] });
+    mock.tabsById.get(tab.id)!.pendingUrl = "https://private.example.org/";
+  }
   for (const listener of mock.runtimeOnMessage) listener({ type: "approvalDecision", id: approvalId, approved: true }, {}, () => {});
   await settle();
-  expect(owner.messages.find((message) => message.id === id)?.error).toMatch(change === "bank-redirect" ? /read.only/i : /no.*shared/i);
+  expect(owner.messages.find((message) => message.id === id)?.error).toMatch(change === "bank-redirect" ? /read.only/i
+    : change === "ungroup" ? /no.*shared/i : /blocked by your blocklist/);
   expect(commands.mock.calls.filter(([, method]) => method === "Input.dispatchKeyEvent")).toEqual([]);
+});
+
+it.each(["hand-shared", "unlabelled-created"])("still prompts for Enter in a %s tab when owned-tab trust is on", async (kind) => {
+  const owner = control("Hephaestus");
+  let tab;
+  if (kind === "hand-shared") {
+    tab = (await mock.chrome.windows.create({ url: "https://example.com/", focused: true })).tabs[0]!;
+    const sharing = mock.actionOnClicked[0]!(tab);
+    await settle(); await sharing;
+  } else tab = await create(control());
+  const windows = vi.spyOn(mock.chrome.windows, "create");
+  const commands = vi.spyOn(mock.chrome.debugger, "sendCommand");
+  commands.mockClear();
+  const id = randomUUID();
+  owner.emit("data", Buffer.from(JSON.stringify({ type: "request", id, action: "press", tabId: tab.id, key: "Enter", trustAgentOwnedTabs: true }) + "\n"));
+  await settle();
+  expect(owner.messages.some((message) => message.id === id)).toBe(false);
+  expect(commands).not.toHaveBeenCalled();
+  const popup = windows.mock.calls.find(([options]) => options.url.includes("approval.html"))![0];
+  const approvalId = new URL(popup.url).searchParams.get("id")!;
+  for (const listener of mock.runtimeOnMessage) listener({ type: "approvalDecision", id: approvalId, approved: true }, {}, () => {});
+  await settle();
+  expect(owner.messages.find((message) => message.id === id)?.result).toEqual({ pressed: "Enter" });
+});
+
+it.each(["owned", "hand-shared"])("refuses every page action in a blocked %s tab with trust on", async (kind) => {
+  const owner = control("Hephaestus");
+  let tab;
+  if (kind === "owned") tab = await create(owner);
+  else {
+    tab = (await mock.chrome.windows.create({ url: "https://example.com/", focused: true })).tabs[0]!;
+    const sharing = mock.actionOnClicked[0]!(tab);
+    await settle(); await sharing;
+  }
+  await mock.chrome.storage.local.set({ blockedDomains: ["example.com"], trustAgentOwnedTabs: true });
+  await settle();
+  const commands = vi.spyOn(mock.chrome.debugger, "sendCommand");
+  commands.mockClear();
+  for (const action of ["snapshot", "screenshot", "scroll", "click", "type", "press", "navigate"]) {
+    expect((await request(owner, { action, tabId: tab.id, snapshotId: `${tab.id}:0`, ref: "ubb-0", key: "Enter", text: "hello", url: "https://example.org/" })).error)
+      .toContain("blocked by your blocklist");
+  }
+  expect(commands).not.toHaveBeenCalled();
+  expect((await request(owner, { action: "createTab", url: "https://sub.example.com/" })).error).toContain("blocked by your blocklist");
 });
 
 it("keeps label ownership through extension reconnects and daemon restarts", async () => {

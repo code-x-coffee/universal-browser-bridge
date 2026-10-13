@@ -5,11 +5,15 @@ main { width: min(720px, calc(100% - 48px)); margin: 0 auto; padding: 72px 0; }
 h1 { font-size: clamp(36px, 7vw, 64px); line-height: .98; letter-spacing: -.045em; margin: 14px 0 22px; }
 .lede { color: #a9c4ca; font-size: 18px; line-height: 1.6; max-width: 620px; }
 label { display: grid; gap: 8px; margin-top: 24px; color: #bcd4d8; font-weight: 700; }
-input { border: 1px solid #29434a; border-radius: 10px; background: #0d1921; color: #f3feff; padding: 13px 14px; font: inherit; }
-input:focus { outline: 2px solid #27b8c7; border-color: transparent; }
+input, textarea { border: 1px solid #29434a; border-radius: 10px; background: #0d1921; color: #f3feff; padding: 13px 14px; font: inherit; }
+input:focus, textarea:focus { outline: 2px solid #27b8c7; border-color: transparent; }
+textarea { box-sizing: border-box; width: 100%; resize: vertical; }
+.checkbox { display: flex; align-items: center; gap: 12px; }
+.checkbox input { width: 18px; height: 18px; accent-color: #51d6e2; }
+.help { color: #a9c4ca; font-size: 14px; line-height: 1.5; }
 .actions { display: flex; align-items: center; gap: 16px; margin-top: 24px; }
 button { border: 0; border-radius: 10px; background: #51d6e2; color: #061215; padding: 13px 18px; font: inherit; font-weight: 850; cursor: pointer; }
-#status { color: #8ce5ad; font-size: 14px; }
+#status, #policyStatus { color: #8ce5ad; font-size: 14px; }
 section { margin-top: 48px; padding: 24px; background: #0d1921; border: 1px solid #223b43; border-radius: 14px; }
 h2 { margin-top: 0; }
 li { margin: 10px 0; color: #b6cbd0; }

@@ -16,7 +16,8 @@ It works with Hermes, Claude Code, Codex, and other MCP clients while keeping yo
 - Multiple simultaneous MCP clients connected through authenticated local IPC
 - Navigation, snapshots, clicking, typing, key presses, scrolling, screenshots, and tab management
 - Generation-scoped DOM references that become invalid after navigation
-- Chrome-hosted human approval for consequential actions
+- Chrome-hosted human approval for consequential actions, with configurable trust for agent-owned tabs
+- A user-editable site blocklist enforced by both the extension and daemon
 - Persistent label ownership of agent-created tabs in named Chrome tab groups
 - Per-tab serialization so multiple agents cannot interleave browser actions
 
@@ -206,7 +207,17 @@ Ownership is stored in [`chrome.storage.session`](https://developer.chrome.com/d
 
 Without a label, `browser_new_tab` keeps the existing behavior: it creates a shared, unowned tab in **Agent Bridge**. All clients may read and drive it. While its creating client remains connected, only that client may close it; after disconnect it may be closed by another client. `browser_list_agent_tabs` requires a label. `browser_close_tab` also accepts hand-shared tabs legitimately controlled by the caller. Hand sharing still uses **Agent Bridge** and the **ON** badge.
 
-Consequential clicks and Enter still require the Chrome approval flow. Bank/payment URLs, including the initial URL of a newly created tab, allow snapshots, screenshots and scrolling, but block clicks, typing, key presses and navigation. The shared [URL policy](extension/url-policy.js) recognizes listed bank/payment domains (including HDFC, ICICI, SBI, Axis, Kotak, PayPal, Stripe and Razorpay), common banking/payment hostname labels, and `/checkout`, `/payment`, `/payments` or `/pay` path segments. It checks current and pending URLs before execution, including after approval waits. This is conservative URL classification, not an exhaustive bank directory. The private-network opt-in does not disable this protection.
+### Trust and site safety settings
+
+Open **Extension options** to change **Trust agent-owned tabs** or **Blocked sites**, then click **Save safety settings**. Both settings are stored in `chrome.storage.local` and apply immediately without restarting the daemon.
+
+**Trust agent-owned tabs** defaults to enabled (`trustAgentOwnedTabs: true` when unset). Consequential clicks and Enter/NumpadEnter skip the approval popup only when the extension confirms that the target tab is currently owned by the calling label. Turn it off to require approval in owned tabs too. Hand-shared and unlabelled tabs always retain the approval flow, and creating the first agent window always requires approval. Clients cannot override the setting with a request flag. Labels remain caller-supplied identities, so authenticated clients using the same label share that trust.
+
+Bank, card, payment and password-manager URLs, including the initial URL of a newly created tab, allow snapshots, screenshots and scrolling, but block clicks, typing, key presses and navigation even with trust enabled. The shared [URL policy](extension/url-policy.js) recognizes listed financial domains (including HDFC, ICICI, SBI, Axis, Kotak, PayPal, Stripe, Razorpay, American Express, Discover, Capital One, Visa and Mastercard), password managers (1Password, Bitwarden, LastPass, Dashlane, Keeper, Google Password Manager, NordPass and Proton Pass), common banking/payment hostname labels, and `/checkout`, `/payment`, `/payments` or `/pay` path segments. It checks current and pending URLs before execution, including after approval waits. Proton's `/pass` pages and `pass.proton.me` are protected without making its other pages read-only. This is conservative URL classification, not an exhaustive sensitive-site directory. The private-network opt-in does not disable it.
+
+**Blocked sites** defaults to empty (`blockedDomains: []`). Enter one domain per line; pasted URLs are accepted. Saving lowercases domains, strips schemes, paths, ports, leading `www.` and trailing dots, converts international names to their ASCII form, and removes empty lines and duplicates. Invalid entries show an error without replacing the saved settings. For example, `https://www.example.com/private` becomes `example.com` and blocks that domain and every subdomain, but does not match `notexample.com` or `example.com.other.org`. To allow a site again, remove its entry and save.
+
+Blocked pages are hidden from tab listings and refuse new tabs, navigation to the domain, snapshots, screenshots, clicks, typing, keys, scrolling and every CDP command. This applies to both owned and hand-shared tabs, regardless of trust. Both the live URL and `pendingUrl` are checked. The extension sends its normalized blocklist over the authenticated connection on connect and on changes; the daemon checks its copy before dispatch and rechecks live tab state through the extension. The extension independently checks again before executing. Refusals contain **"blocked by your blocklist"**. The blocklist controls bridge access to tabs; it does not filter a page's network requests or stop you from opening sites yourself. Previously saved annotations remain available in the local annotation store.
 
 ## Annotations
 
@@ -304,9 +315,9 @@ Both commands use the authenticated daemon control socket, so **serve** must be 
 | `browser_close_tab` | Close a caller-owned tab or a tab otherwise legitimately shared with the caller |
 | `browser_snapshot` | Read compact interactive elements and receive a `snapshotId` |
 | `browser_navigate` | Navigate a shared tab to an allowed URL |
-| `browser_click` | Click a snapshot element, with approval when consequential |
+| `browser_click` | Click a snapshot element, with consequential approval unless the caller's owned tab is trusted |
 | `browser_type` | Replace the contents of a snapshot input element |
-| `browser_press` | Send a key press; Enter requires human approval |
+| `browser_press` | Send a key press; Enter requires approval unless the caller's owned tab is trusted |
 | `browser_scroll` | Scroll a shared page by pixels |
 | `browser_screenshot` | Capture a PNG screenshot of a shared tab |
 | `annotations_list` | List saved annotations by exact URL and status |
@@ -394,7 +405,7 @@ npm run build
 
 The test suite includes real local sockets and real subprocesses. It starts a daemon, multiple MCP adapters, and a fake extension WebSocket peer. No Chrome interaction is required.
 
-Restricted environments can run the socket-free tests, including the real extension/bridge/daemon/MCP ownership flow over mocked socket and Chrome boundaries:
+Restricted environments can run the socket-free tests, including the real extension/bridge/daemon/MCP ownership, trust and blocklist flows over mocked socket and Chrome boundaries:
 
 ```bash
 npm test -- --exclude src/bridge.test.ts --exclude src/daemon.test.ts --exclude src/background-owner-race.test.ts --exclude src/cli-integration.test.ts
@@ -517,7 +528,9 @@ Chrome assigns unpacked extensions an identity based partly on their loaded dire
 - Password input values are omitted from snapshots.
 - Navigation and new tabs accept only allowed `http:` and `https:` URLs.
 - Localhost and private-network destinations are blocked unless explicitly enabled.
-- Consequential clicks and Enter presses require Chrome-hosted human approval.
+- Consequential clicks and Enter presses require Chrome-hosted human approval unless the extension's trust setting is enabled and the live tab belongs to the caller's label.
+- Creating the agent window always requires approval; bank, card, payment and password-manager pages always remain read-only.
+- Blocklisted domains and their subdomains refuse all page operations in owned and hand-shared tabs, with current and pending URL checks in both the daemon and extension.
 - The model cannot approve its own request.
 - Agent-created tabs belong to their creating adapter while it is connected.
 - Per-tab queues prevent concurrent agents from interleaving actions.
