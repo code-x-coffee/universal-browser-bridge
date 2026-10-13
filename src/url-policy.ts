@@ -36,4 +36,4 @@ export function assertBrowserUrlAllowed(value: string): boolean {
   }
 }
 
-export { isReadOnlyBrowserUrl } from "../extension/url-policy.js";
+export { isReadOnlyBrowserUrl, normalizeBlockedDomains, isBlockedBrowserUrl, assertTabNotBlocked } from "../extension/url-policy.js";

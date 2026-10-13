@@ -1,4 +1,4 @@
-import { isReadOnlyBrowserUrl } from "./url-policy.js";
+import { isReadOnlyBrowserUrl, normalizeBlockedDomains, isBlockedBrowserUrl, assertTabNotBlocked } from "./url-policy.js";
 
 const PROTOCOL_VERSION = 1;
 const DEFAULT_URL = "ws://127.0.0.1:17321/extension";
@@ -30,13 +30,14 @@ let authenticated = false;
 const REVOCATION_DEBOUNCE_MS = 250;
 
 async function settings() {
-  return chrome.storage.local.get({ relayUrl: DEFAULT_URL, token: "" });
+  const saved = await chrome.storage.local.get({ relayUrl: DEFAULT_URL, token: "", trustAgentOwnedTabs: true, blockedDomains: [] });
+  return { ...saved, blockedDomains: normalizeBlockedDomains(saved.blockedDomains) };
 }
 
 async function connect() {
   authenticated = false;
   clearTimeout(reconnectTimer);
-  const { relayUrl, token } = await settings();
+  const { relayUrl, token, blockedDomains } = await settings();
   if (!token) {
     setGlobalBadge("?", "#b45309");
     return;
@@ -46,7 +47,7 @@ async function connect() {
   socket = connection;
   connection.addEventListener("open", () => {
     if (socket !== connection) return;
-    connection.send(JSON.stringify({ type: "hello", token, version: PROTOCOL_VERSION }));
+    connection.send(JSON.stringify({ type: "hello", token, version: PROTOCOL_VERSION, blockedDomains }));
     // Regular WebSocket traffic keeps the MV3 service worker alive (Chrome 116+
     // resets the 30s idle timer on each message).
     clearInterval(keepaliveTimer);
@@ -76,6 +77,7 @@ async function handleMessage(message) {
     authenticated = true;
     setGlobalBadge("", "#0891b2");
     await tabStateReady;
+    await sendSitePolicy();
     await sendTabs();
     for (const tabId of sharedTabs) void refreshAnnotations(tabId).catch(() => {});
     return;
@@ -103,6 +105,7 @@ async function handleMessage(message) {
     if (message.action === "listTabs") result = (await tabList()).filter((tab) => !tab.ownerLabel || tab.ownerLabel === message.label);
     if (message.action === "getTab") {
       result = await assertControlledTab(message.tabId, message.label);
+      await assertUnblockedTab(result);
     }
     if (message.action === "listAgentTabs") {
       if (!message.label) throw new Error("An agent label is required to list owned tabs");
@@ -116,6 +119,7 @@ async function handleMessage(message) {
         await shareTab(tab.id, message.label);
         if (!message.label) await persistAgentTabs();
         result = await chrome.tabs.get(tab.id);
+        await assertUnblockedTab(result);
       } catch (error) {
         await unshareTab(tab.id, { ungroup: false }).catch(() => {});
         await chrome.tabs.remove(tab.id).catch(() => {});
@@ -134,18 +138,44 @@ async function handleMessage(message) {
       result = { closed: message.tabId };
     }
     if (message.action === "requestApproval") {
-      result = { approved: await requestApproval(message.description || "Allow this browser action?") };
+      let trusted = false;
+      if (message.tabId !== undefined) {
+        const tab = await assertControlledTab(message.tabId, message.label);
+        const { trustAgentOwnedTabs, blockedDomains } = await settings();
+        assertTabNotBlocked(tab, blockedDomains);
+        assertWritableTab(tab);
+        trusted = trustAgentOwnedTabs === true && Boolean(message.label)
+          && agentTabOwners.get(message.tabId)?.label === message.label;
+      }
+      result = { approved: trusted || await requestApproval(message.description || "Allow this browser action?") };
     }
     if (message.action === "cdp") {
       const tab = await assertControlledTab(message.tabId, message.label);
-      if (message.requiresWritable && (isReadOnlyBrowserUrl(tab.url) || (tab.pendingUrl && isReadOnlyBrowserUrl(tab.pendingUrl)))) {
-        throw new Error("Bank and payment pages are read-only");
-      }
+      const { blockedDomains } = await settings();
+      assertTabNotBlocked(tab, blockedDomains);
+      if (message.method === "Page.navigate") assertTabNotBlocked({ url: message.params?.url }, blockedDomains);
+      if (message.requiresWritable) assertWritableTab(tab);
       result = await chrome.debugger.sendCommand({ tabId: message.tabId }, message.method, message.params || {});
     }
     send({ type: "response", id: message.id, result });
   } catch (error) {
     send({ type: "response", id: message.id, error: error?.message || String(error) });
+  }
+}
+
+async function assertUnblockedTab(tab) {
+  const { blockedDomains } = await settings();
+  assertTabNotBlocked(tab, blockedDomains);
+}
+
+async function sendSitePolicy() {
+  const { blockedDomains } = await settings();
+  if (authenticated) send({ type: "sitePolicy", blockedDomains });
+}
+
+function assertWritableTab(tab) {
+  if (isReadOnlyBrowserUrl(tab.url) || (tab.pendingUrl && isReadOnlyBrowserUrl(tab.pendingUrl))) {
+    throw new Error("Bank, card, payment and password-manager pages are read-only");
   }
 }
 
@@ -165,6 +195,7 @@ async function assertControlledTab(tabId, label) {
 
 async function shareTab(tabId, label) {
   if (!tabId || sharedTabs.has(tabId)) return;
+  await assertUnblockedTab(await chrome.tabs.get(tabId));
   await chrome.debugger.attach({ tabId }, "1.3");
   groupingInProgress.add(tabId);
   try {
@@ -242,10 +273,12 @@ async function restoreSharedTabs(revokedOwnedTabIds = new Set()) {
 
 // Agent-created tabs live in their own window so they never crowd the user's.
 async function createAgentTab(url, label) {
+  await assertUnblockedTab({ url });
   const { agentWindowId } = await chrome.storage.session.get("agentWindowId");
   if (agentWindowId !== undefined) {
     const window = await chrome.windows.get(agentWindowId).catch(() => undefined);
     if (window) {
+      await assertUnblockedTab({ url });
       return chrome.tabs.create({ windowId: agentWindowId, url, active: false });
     }
   }
@@ -253,6 +286,7 @@ async function createAgentTab(url, label) {
     `${label ? `[${label}] ` : ""}Create an agent-controlled Chrome window? Tabs opened there can use your signed-in Chrome session. First URL: ${url}`
   );
   if (!approved) throw new Error("User denied creation of the agent-controlled window");
+  await assertUnblockedTab({ url });
   const window = await chrome.windows.create({ url, focused: false });
   await chrome.storage.session.set({ agentWindowId: window.id });
   return window.tabs[0];
@@ -362,16 +396,19 @@ function finishApproval(id, approved) {
 
 async function tabList() {
   const tabs = [];
+  const { blockedDomains } = await settings();
   for (const id of sharedTabs) {
     if (groupingInProgress.has(id)) continue;
     try {
       const tab = await chrome.tabs.get(id);
+      if (isBlockedBrowserUrl(tab.url, blockedDomains) || isBlockedBrowserUrl(tab.pendingUrl, blockedDomains)) continue;
       if (!await isInAgentGroup(id)) {
         await unshareTab(id, { ungroup: false, notify: false });
         continue;
       }
       const owner = agentTabOwners.get(id);
       tabs.push({ id, title: tab.title || "", url: tab.url || "", active: Boolean(tab.active),
+        ...(tab.pendingUrl ? { pendingUrl: tab.pendingUrl } : {}),
         ...(owner ? { ownerLabel: owner.label, groupId: tab.groupId } : {}) });
     } catch {
       sharedTabs.delete(id);
@@ -406,6 +443,7 @@ function annotationRequest(body) {
 
 async function injectAnnotations(tabId) {
   if (!sharedTabs.has(tabId)) throw new Error("Share this tab before annotating it");
+  await assertUnblockedTab(await chrome.tabs.get(tabId));
   await chrome.scripting.executeScript({ target: { tabId }, files: ["annotation-utils.js", "annotations.js"] });
   if (!sharedTabs.has(tabId)) {
     await chrome.tabs.sendMessage(tabId, { type: "ubbAnnotationsDestroy" }).catch(() => {});
@@ -449,6 +487,7 @@ async function saveAnnotation(message, sender) {
   const url = message.annotation?.url;
   const assertCurrent = async () => {
     const current = await chrome.tabs.get(tabId);
+    await assertUnblockedTab(current);
     const active = await chrome.tabs.query({ windowId: tab.windowId, active: true });
     if (!sharedTabs.has(tabId) || current.status === "loading" || current.url !== url || sender.url !== url || generation !== tabGenerations.get(tabId) || active[0]?.id !== tabId) {
       throw new Error("Keep the shared annotation tab active at the same URL while saving");
@@ -579,6 +618,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && (changes.token || changes.relayUrl)) void connect();
+  if (area === "local" && changes.blockedDomains) void sendSitePolicy().then(sendTabs);
 });
 
 const tabStateReady = restoreAgentTabs().then(restoreSharedTabs);

@@ -239,3 +239,104 @@ it("does not restore an interrupted labelled creation as an unowned shared tab",
   await loadWorker();
   expect((await command({ action: "listTabs", label: "Hermes" })).result).toEqual([]);
 });
+
+it.each([true, false])("refuses blocked new tabs before creation or approval (agent window exists=%s)", async (hasWindow) => {
+  if (!hasWindow) await mock.chrome.storage.session.remove("agentWindowId");
+  await mock.chrome.storage.local.set({ blockedDomains: ["https://WWW.Example.com/private"] });
+  const tabs = vi.spyOn(mock.chrome.tabs, "create");
+  const windows = vi.spyOn(mock.chrome.windows, "create");
+  const response = await command({ action: "createTab", url: "https://login.example.com/", label: "Hephaestus" });
+  expect(response.error).toContain("blocked by your blocklist");
+  expect(tabs).not.toHaveBeenCalled();
+  expect(windows).not.toHaveBeenCalled();
+});
+
+it("always asks before creating the first agent window even with owned-tab trust on", async () => {
+  await mock.chrome.storage.session.remove("agentWindowId");
+  await mock.chrome.storage.local.set({ trustAgentOwnedTabs: true });
+  const windows = vi.spyOn(mock.chrome.windows, "create");
+  FakeSocket.instance.deliver({ type: "command", id: "first-window", action: "createTab", label: "Hephaestus", url: "https://example.com/" });
+  await settle();
+  expect(FakeSocket.instance.messages.some((message) => message.id === "first-window")).toBe(false);
+  expect(windows).toHaveBeenCalledTimes(1);
+  const popup = windows.mock.calls[0]![0];
+  expect(popup.url).toContain("approval.html");
+  const id = new URL(popup.url).searchParams.get("id")!;
+  for (const listener of mock.runtimeOnMessage) listener({ type: "approvalDecision", id, approved: false }, {}, () => {});
+  await settle();
+  expect(FakeSocket.instance.messages.find((message) => message.id === "first-window").error).toMatch(/denied/i);
+});
+
+it("rechecks the blocklist after approval before creating an agent window", async () => {
+  await mock.chrome.storage.session.remove("agentWindowId");
+  const windows = vi.spyOn(mock.chrome.windows, "create");
+  FakeSocket.instance.deliver({ type: "command", id: "first-window", action: "createTab", label: "Hephaestus", url: "https://example.com/" });
+  await settle();
+  const popup = windows.mock.calls[0]![0];
+  const id = new URL(popup.url).searchParams.get("id")!;
+  await mock.chrome.storage.local.set({ blockedDomains: ["example.com"] });
+  for (const listener of mock.runtimeOnMessage) listener({ type: "approvalDecision", id, approved: true }, {}, () => {});
+  await settle();
+  expect(FakeSocket.instance.messages.find((message) => message.id === "first-window").error).toContain("blocked by your blocklist");
+  expect(windows).toHaveBeenCalledTimes(1);
+});
+
+it("uses live ownership and pending URLs for approval rather than command-supplied trust flags", async () => {
+  const tab = await create("Hephaestus");
+  const windows = vi.spyOn(mock.chrome.windows, "create");
+  expect((await command({ action: "requestApproval", tabId: tab.id, label: "Hermes", trustAgentOwnedTabs: true })).error)
+    .toMatch(/owned.*Hephaestus/i);
+  mock.tabsById.get(tab.id)!.pendingUrl = "https://passwords.google.com/";
+  expect((await command({ action: "requestApproval", tabId: tab.id, label: "Hephaestus", trustAgentOwnedTabs: true })).error)
+    .toMatch(/read.only/i);
+  expect((await command({ action: "cdp", tabId: tab.id, label: "Hephaestus", method: "Input.dispatchKeyEvent", requiresWritable: true })).error)
+    .toMatch(/read.only/i);
+  expect(windows).not.toHaveBeenCalled();
+});
+
+it("sends a normalized blocklist on connect, on change and after a worker restart", async () => {
+  expect(FakeSocket.instance.messages.find((message) => message.type === "hello").blockedDomains).toEqual([]);
+  await mock.chrome.storage.local.set({ blockedDomains: ["HTTPS://WWW.Example.org/path", "example.org"] });
+  await settle();
+  expect(FakeSocket.instance.messages.filter((message) => message.type === "sitePolicy").at(-1).blockedDomains).toEqual(["example.org"]);
+  FakeSocket.instance.close();
+  vi.clearAllTimers(); mock.resetWorkerListeners();
+  await loadWorker();
+  expect(FakeSocket.instance.messages.find((message) => message.type === "hello").blockedDomains).toEqual(["example.org"]);
+});
+
+it.each(["url", "pendingUrl"] as const)("refuses every CDP call and getTab against a blocked live %s", async (field) => {
+  const tab = await create("Hephaestus");
+  mock.tabsById.get(tab.id)![field] = "https://vault.example.org/private";
+  await mock.chrome.storage.local.set({ blockedDomains: ["example.org"], trustAgentOwnedTabs: true });
+  const commands = vi.spyOn(mock.chrome.debugger, "sendCommand");
+  for (const method of ["Runtime.evaluate", "Runtime.callFunctionOn", "DOM.getDocument", "Page.captureScreenshot",
+    "Page.navigate", "Input.dispatchKeyEvent"]) {
+    expect((await command({ action: "cdp", tabId: tab.id, label: "Hephaestus", method })).error)
+      .toContain("blocked by your blocklist");
+  }
+  expect((await command({ action: "getTab", tabId: tab.id, label: "Hephaestus" })).error).toContain("blocked by your blocklist");
+  expect(commands).not.toHaveBeenCalled();
+});
+
+it("refuses a blocked CDP navigation target while the current page is allowed", async () => {
+  const tab = await create("Hephaestus");
+  await mock.chrome.storage.local.set({ blockedDomains: ["example.org"] });
+  const commands = vi.spyOn(mock.chrome.debugger, "sendCommand");
+  expect((await command({ action: "cdp", tabId: tab.id, label: "Hephaestus", method: "Page.navigate",
+    params: { url: "https://www.example.org/private" }, requiresWritable: true })).error).toContain("blocked by your blocklist");
+  expect(commands).not.toHaveBeenCalled();
+});
+
+it("refuses blocked hand-shared tabs and hides them from listings", async () => {
+  const tab = (await mock.chrome.windows.create({ url: "https://example.org/", focused: true })).tabs[0]!;
+  const sharing = mock.actionOnClicked[0]!(tab);
+  await settle(); await sharing;
+  await mock.chrome.storage.local.set({ blockedDomains: ["example.org"] });
+  expect((await command({ action: "cdp", tabId: tab.id, label: "Hephaestus", method: "Page.captureScreenshot" })).error)
+    .toContain("blocked by your blocklist");
+  expect((await command({ action: "listTabs", label: "Hephaestus" })).result).toEqual([]);
+  expect((await command({ action: "getTab", tabId: tab.id, label: "Hephaestus" })).error).toContain("blocked by your blocklist");
+  await mock.chrome.storage.local.set({ blockedDomains: [] });
+  expect((await command({ action: "getTab", tabId: tab.id, label: "Hephaestus" })).error).toBeUndefined();
+});

@@ -9,7 +9,7 @@ import { isPotentiallyConsequential } from "./policy.js";
 import { PROTOCOL_VERSION, type AnnotationExtensionRequest, type ControlClientMessage, type ControlServerMessage, type SharedTab } from "./protocol.js";
 import { clickDetailsScript, clickScript, describeKey, scrollScript, snapshotScript, typeScript } from "./dom-actions.js";
 import { TabLeaseManager } from "./tab-lease.js";
-import { assertBrowserUrlAllowed, isReadOnlyBrowserUrl } from "./url-policy.js";
+import { assertBrowserUrlAllowed, isReadOnlyBrowserUrl, assertTabNotBlocked, isBlockedBrowserUrl } from "./url-policy.js";
 
 type ControlRequest = Extract<ControlClientMessage, { type: "request" }>;
 
@@ -20,7 +20,18 @@ type ClientInfo = { socket: Socket; label?: string };
 // agent-window approval/creation flow at once.
 const CREATE_TAB_LOCK = -1;
 
+async function getUnblockedTab(bridge: BrowserBridge, tabId: number, label: string | undefined): Promise<{ url: string; pendingUrl?: string }> {
+  const cached = bridge.status().tabs.find((tab) => tab.id === tabId);
+  if (cached) assertTabNotBlocked(cached, bridge.blockedDomains);
+  const tab = await bridge.command({ action: "getTab", tabId, label }) as { url: string; pendingUrl?: string };
+  // Policy may change while the live lookup is in flight.
+  assertTabNotBlocked(tab, bridge.blockedDomains);
+  return tab;
+}
+
 async function cdp(bridge: BrowserBridge, tabId: number, label: string | undefined, method: string, params: Record<string, unknown> = {}, requiresWritable = false): Promise<any> {
+  if (method === "Page.navigate") assertTabNotBlocked({ url: params.url as string }, bridge.blockedDomains);
+  await getUnblockedTab(bridge, tabId, label);
   return bridge.command({ action: "cdp", tabId, label, method, params, requiresWritable });
 }
 
@@ -228,9 +239,9 @@ export class DaemonServer {
   private async assertWritableTab(tabId: number, label: string | undefined): Promise<void> {
     // Read live Chrome state under the tab lease, including after an approval
     // wait. Cached broadcasts can lag redirects or a user's navigation.
-    const tab = await this.bridge.command({ action: "getTab", tabId, label }) as { url: string; pendingUrl?: string };
+    const tab = await getUnblockedTab(this.bridge, tabId, label);
     if (isReadOnlyBrowserUrl(tab.url) || (tab.pendingUrl && isReadOnlyBrowserUrl(tab.pendingUrl))) {
-      throw new Error("Bank and payment pages are read-only; clicking, typing, key presses and navigation are disabled");
+      throw new Error("Bank, card, payment and password-manager pages are read-only; clicking, typing, key presses and navigation are disabled");
     }
   }
 
@@ -238,21 +249,27 @@ export class DaemonServer {
   // identity. Only called from inside a held tab lease (or the createTab
   // lock), so it is never something an adapter can trigger unilaterally or
   // race against other operations on the same tab.
-  private async approve(clientId: string, description: string): Promise<void> {
+  private async approve(clientId: string, tabId: number, description: string): Promise<void> {
     const labelled = `[${this.requesterLabel(clientId)}] ${description}`;
-    const result = (await this.bridge.command({ action: "requestApproval", description: labelled })) as { approved?: boolean };
+    const label = this.clients.get(clientId)?.label;
+    const result = (await this.bridge.command({ action: "requestApproval", tabId, label, description: labelled })) as { approved?: boolean };
     if (!result?.approved) throw new Error(`User denied browser action: ${description}`);
   }
 
   private async dispatch(message: ControlRequest, clientId: string): Promise<unknown> {
     const { action, tabId } = message;
     const label = this.clients.get(clientId)?.label;
+    const unblocked = (tab: { url: string; pendingUrl?: string }) =>
+      !isBlockedBrowserUrl(tab.url, this.bridge.blockedDomains) && !isBlockedBrowserUrl(tab.pendingUrl, this.bridge.blockedDomains);
 
     if (action === "status") {
       const status = this.bridge.status();
-      return { ...status, tabs: status.tabs.filter((tab) => !tab.ownerLabel || tab.ownerLabel === label) };
+      return { ...status, tabs: status.tabs.filter((tab) => (!tab.ownerLabel || tab.ownerLabel === label) && unblocked(tab)) };
     }
-    if (action === "listTabs" || action === "listAgentTabs") return this.bridge.command({ action, label });
+    if (action === "listTabs" || action === "listAgentTabs") {
+      const tabs = await this.bridge.command({ action, label }) as Array<{ url: string; pendingUrl?: string }>;
+      return tabs.filter(unblocked);
+    }
     if (action === "annotationsList") return this.annotations.list({ url: message.url, status: message.status });
     if (action === "annotationsWebhookStatus") return this.webhook.status();
     if (action === "annotationsWebhookTest") return this.webhook.test();
@@ -278,6 +295,7 @@ export class DaemonServer {
     if (action === "createTab") {
       return this.leases.runExclusive(CREATE_TAB_LOCK, async () => {
         if (!message.url || !assertBrowserUrlAllowed(message.url)) throw new Error("Only allowed public http(s) URLs can be opened");
+        assertTabNotBlocked({ url: message.url }, this.bridge.blockedDomains);
         const tab = (await this.bridge.command({ action: "createTab", url: message.url, label })) as { id: number };
         if (!label) this.tabOwners.set(tab.id, clientId);
         this.knownTabIds.add(tab.id);
@@ -330,7 +348,7 @@ export class DaemonServer {
           .filter(Boolean)
           .join(" | ");
         if (isPotentiallyConsequential(actionSummary)) {
-          await this.approve(clientId, `Allow click: ${actionSummary}`);
+          await this.approve(clientId, tabId, `Allow click: ${actionSummary}`);
           await this.assertWritableTab(tabId, label);
         }
         return evaluate(this.bridge, tabId, label, clickScript(ref), true);
@@ -347,8 +365,9 @@ export class DaemonServer {
 
     if (action === "navigate") {
       return this.leases.runExclusive(tabId, async () => {
-        await this.assertWritableTab(tabId, label);
         if (!message.url || !assertBrowserUrlAllowed(message.url)) throw new Error("Only allowed public http(s) URLs can be opened");
+        assertTabNotBlocked({ url: message.url }, this.bridge.blockedDomains);
+        await this.assertWritableTab(tabId, label);
         const result = await cdp(this.bridge, tabId, label, "Page.navigate", { url: message.url }, true);
         this.leases.bumpGeneration(tabId);
         return result;
@@ -362,7 +381,7 @@ export class DaemonServer {
         await this.assertWritableTab(tabId, label);
         const key = message.key ?? "";
         if (/^(enter|numpadenter)$/i.test(key)) {
-          await this.approve(clientId, `Allow ${key}? It may submit the current form.`);
+          await this.approve(clientId, tabId, `Allow ${key}? It may submit the current form.`);
           await this.assertWritableTab(tabId, label);
         }
         const descriptor = describeKey(key);

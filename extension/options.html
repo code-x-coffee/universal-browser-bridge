@@ -13,17 +13,28 @@
       <p class="lede">Only tabs marked <strong>ON</strong> are visible to paired agents. Click the toolbar icon on a tab to share or revoke it.</p>
       <label>Relay URL<input id="relayUrl" type="url" value="ws://127.0.0.1:17321/extension" /></label>
       <label>Pairing token<input id="token" type="password" autocomplete="off" placeholder="Run npm run token" /></label>
-      <div class="actions"><button id="save">Save and connect</button><span id="status"></span></div>
+      <div class="actions"><button id="save">Save and connect</button><span id="status" role="status"></span></div>
+      <section>
+        <h2>Agent access</h2>
+        <label class="checkbox"><input id="trustAgentOwnedTabs" type="checkbox" aria-describedby="trustHelp" />Trust agent-owned tabs</label>
+        <p id="trustHelp" class="help">Skip click and Enter approval only in tabs created by the calling agent's label; hand-shared tabs still ask.</p>
+        <label for="blockedDomains">Blocked sites</label>
+        <p id="blocklistHelp" class="help">One domain per line. Each domain and its subdomains are blocked from agent access, including hand-shared tabs.</p>
+        <textarea id="blockedDomains" rows="5" spellcheck="false" aria-describedby="blocklistHelp" placeholder="example.com&#10;vault.example.org"></textarea>
+        <div class="actions"><button id="savePolicy">Save safety settings</button><span id="policyStatus" role="status"></span></div>
+      </section>
       <section>
         <h2>Safety boundary</h2>
         <ul>
           <li>The bridge listens only on your computer.</li>
-          <li>Agents see only tabs you explicitly share.</li>
+          <li>Agents see only tabs you explicitly share or let them create.</li>
+          <li>Bank, card, payment and password-manager pages stay read-only, even in trusted tabs.</li>
+          <li>Creating the agent window always asks for approval.</li>
           <li>Remove a tab by clicking the toolbar icon again.</li>
           <li>Do not share banking, password-manager, or payment tabs.</li>
         </ul>
       </section>
     </main>
-    <script src="options.js"></script>
+    <script type="module" src="options.js"></script>
   </body>
 </html>
