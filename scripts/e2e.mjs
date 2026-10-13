@@ -99,7 +99,7 @@ async function runScenario(client, secondClient) {
 
   // Tool listing sanity check
   const { tools } = await client.listTools();
-  record("list tools", tools.length === 11, tools.map((t) => t.name).join(", "));
+  record("list tools", ["browser_new_tab", "browser_list_agent_tabs", "browser_close_tab", "browser_snapshot"].every((name) => tools.some((tool) => tool.name === name)), tools.map((t) => t.name).join(", "));
 
   // Wait up to 10 minutes for the user to reload the extension and pair it
   let status = { connected: false };
@@ -126,7 +126,7 @@ async function runScenario(client, secondClient) {
   const closeByOther = await callSecond("browser_close_tab", { tabId });
   record(
     "other adapter cannot close this tab",
-    closeByOther.isError === true && /owning client|owner/i.test(textOf(closeByOther)),
+    closeByOther.isError === true && /owned|owning client|owner/i.test(textOf(closeByOther)),
     textOf(closeByOther).slice(0, 140)
   );
 

@@ -9,6 +9,7 @@ import { DaemonServer } from "./daemon.js";
 import { DaemonClient } from "./daemon-client.js";
 import { AnnotationStore } from "./annotations.js";
 import { annotationDraft, annotationScreenshot } from "./test-support/annotation-fixture.js";
+import type { SharedTab } from "./protocol.js";
 
 const TOKEN = "daemon-test-token";
 
@@ -17,7 +18,7 @@ const TOKEN = "daemon-test-token";
 class FakeExtension {
   ws!: WebSocket;
   nextTabId = 1;
-  tabs: { id: number; title: string; url: string; active: boolean }[] = [];
+  tabs: SharedTab[] = [];
   delayMs = 0;
   approvalDecision = true;
   approvalDelayMs = 0;
@@ -71,7 +72,8 @@ class FakeExtension {
         this.maxConcurrentCreateTab = Math.max(this.maxConcurrentCreateTab, this.concurrentCreateTab);
         try {
           if (this.delayMs) await new Promise((resolve) => setTimeout(resolve, this.delayMs));
-          const tab = { id: this.nextTabId++, title: "New Tab", url: message.url, active: true };
+          const tab = { id: this.nextTabId++, title: "New Tab", url: message.url, active: true,
+            ...(message.label ? { ownerLabel: message.label, groupId: 1 } : {}) };
           this.tabs.push(tab);
           this.send({ type: "tabs", tabs: this.tabs });
           this.send({ type: "response", id, result: tab });
@@ -83,7 +85,18 @@ class FakeExtension {
 
       if (this.delayMs) await new Promise((resolve) => setTimeout(resolve, this.delayMs));
 
-      if (action === "listTabs") return this.send({ type: "response", id, result: this.tabs });
+      if (action === "listTabs") return this.send({ type: "response", id, result: this.tabs.filter((tab) => !tab.ownerLabel || tab.ownerLabel === message.label) });
+      if (action === "listAgentTabs") {
+        if (!message.label) throw new Error("An agent label is required");
+        return this.send({ type: "response", id, result: this.tabs.filter((tab) => tab.ownerLabel === message.label)
+          .map(({ id: tabId, url, title, groupId }) => ({ tabId, url, title, groupId })) });
+      }
+      if (["getTab", "closeTab", "cdp"].includes(action)) {
+        const tab = this.tabs.find((tab) => tab.id === message.tabId);
+        if (!tab) throw new Error("Tab is not shared");
+        if (tab.ownerLabel && tab.ownerLabel !== message.label) throw new Error(`Tab is owned by ${tab.ownerLabel}`);
+        if (action === "getTab") return this.send({ type: "response", id, result: tab });
+      }
       if (action === "closeTab") {
         this.tabs = this.tabs.filter((t) => t.id !== message.tabId);
         this.send({ type: "tabs", tabs: this.tabs });
@@ -152,9 +165,9 @@ beforeEach(async () => {
 
 afterEach(async () => {
   for (const client of clients.splice(0)) await client.close();
-  extension.close();
-  await daemon.stop();
-  await bridge.stop();
+  extension?.close();
+  await daemon?.stop();
+  await bridge?.stop();
   await rm(tempDir, { recursive: true, force: true });
 });
 
@@ -208,7 +221,7 @@ describe("DaemonServer + DaemonClient", () => {
   });
 
   it("shows both clients the same shared status, and one disconnecting does not break the other", async () => {
-    const a = makeClient("client-a");
+    const a = makeClient();
     const b = makeClient("client-b");
     await a.connect();
     await b.connect();
@@ -240,7 +253,7 @@ describe("DaemonServer + DaemonClient", () => {
   it("serializes operations on the same tab across clients", async () => {
     extension.delayMs = 40;
     const a = makeClient("client-a");
-    const b = makeClient("client-b");
+    const b = makeClient("client-a");
     await a.connect();
     await b.connect();
     const created = (await a.request({ action: "createTab", url: "https://example.com" })) as { id: number };
@@ -256,7 +269,7 @@ describe("DaemonServer + DaemonClient", () => {
 
   it("cleans up leases on disconnect so the next client is not blocked", async () => {
     const a = makeClient("client-a");
-    const b = makeClient("client-b");
+    const b = makeClient("client-a");
     await a.connect();
     await b.connect();
     const created = (await a.request({ action: "createTab", url: "https://example.com" })) as { id: number };
@@ -301,7 +314,7 @@ describe("DaemonServer + DaemonClient", () => {
     await b.connect();
     const created = (await a.request({ action: "createTab", url: "https://example.com" })) as { id: number };
 
-    await expect(b.request({ action: "closeTab", tabId: created.id })).rejects.toThrow(/owning client|owner/i);
+    await expect(b.request({ action: "closeTab", tabId: created.id })).rejects.toThrow(/owned|owning client|owner/i);
     await expect(a.request({ action: "closeTab", tabId: created.id })).resolves.toBeTruthy();
   });
 
@@ -347,8 +360,8 @@ describe("DaemonServer + DaemonClient", () => {
 
   // --- Finding 2: ownership release on disconnect + reconciliation of stale tab state ---
 
-  it("releases tab ownership when the owning client disconnects, so a later client can close it", async () => {
-    const a = makeClient("client-a");
+  it("releases legacy unlabeled tab ownership when its client disconnects", async () => {
+    const a = makeClient();
     await a.connect();
     const created = (await a.request({ action: "createTab", url: "https://example.com" })) as { id: number };
 
@@ -367,7 +380,7 @@ describe("DaemonServer + DaemonClient", () => {
     await b.connect();
     const created = (await a.request({ action: "createTab", url: "https://example.com" })) as { id: number };
 
-    await expect(b.request({ action: "closeTab", tabId: created.id })).rejects.toThrow(/owning client|owner/i);
+    await expect(b.request({ action: "closeTab", tabId: created.id })).rejects.toThrow(/owned|owning client|owner/i);
     // a is still connected; ownership must not have been released.
     await expect(a.request({ action: "closeTab", tabId: created.id })).resolves.toBeTruthy();
   });
@@ -391,7 +404,7 @@ describe("DaemonServer + DaemonClient", () => {
     const snapshot = (await b.request({ action: "snapshot", tabId: reused.id })) as { snapshotId: string };
     expect(snapshot.snapshotId).toBe(`${reused.id}:0`);
 
-    await expect(a.request({ action: "closeTab", tabId: reused.id })).rejects.toThrow(/owning client|owner/i);
+    await expect(a.request({ action: "closeTab", tabId: reused.id })).rejects.toThrow(/owned|owning client|owner/i);
     await expect(b.request({ action: "closeTab", tabId: reused.id })).resolves.toBeTruthy();
   });
 
@@ -400,7 +413,7 @@ describe("DaemonServer + DaemonClient", () => {
   it("keeps click's detail lookup, approval wait, and execution atomic so no other tab operation can interleave", async () => {
     extension.approvalDelayMs = 80;
     const a = makeClient("client-a");
-    const b = makeClient("client-b");
+    const b = makeClient("client-a");
     await a.connect();
     await b.connect();
     const created = (await a.request({ action: "createTab", url: "https://example.com" })) as { id: number };

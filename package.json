@@ -6,6 +6,7 @@
   "description": "A local, agent-agnostic Chrome bridge with explicit tab sharing and MCP tools.",
   "license": "MIT",
   "bin": {
+    "ubb": "dist/cli.js",
     "universal-browser-bridge": "dist/cli.js"
   },
   "scripts": {

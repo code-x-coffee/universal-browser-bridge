@@ -2,7 +2,7 @@
 
 # Universal Agent Browser Bridge
 
-A local, agent-agnostic bridge that lets MCP-compatible AI agents operate only the Chrome tabs you explicitly share.
+A local, agent-agnostic bridge that lets MCP-compatible AI agents operate Chrome tabs you explicitly share or create under their agent label.
 
 It works with Hermes, Claude Code, Codex, and other MCP clients while keeping your signed-in Chrome session, tab access, and consequential-action approvals under your control.
 
@@ -17,7 +17,7 @@ It works with Hermes, Claude Code, Codex, and other MCP clients while keeping yo
 - Navigation, snapshots, clicking, typing, key presses, scrolling, screenshots, and tab management
 - Generation-scoped DOM references that become invalid after navigation
 - Chrome-hosted human approval for consequential actions
-- Per-client ownership of agent-created tabs
+- Persistent label ownership of agent-created tabs in named Chrome tab groups
 - Per-tab serialization so multiple agents cannot interleave browser actions
 
 ## Architecture
@@ -187,6 +187,27 @@ Do not configure every adapter to run `serve`. Only one daemon should run. Every
 
 Chrome internal pages, extension pages, password-manager prompts, passkeys, native dialogs, and arbitrary desktop applications are intentionally outside the bridge's scope.
 
+### Agent-owned tabs
+
+Set `UBB_CLIENT_LABEL` for an MCP adapter, or pass `--label` to the CLI. A labelled `browser_new_tab` creates a tab in the dedicated agent window and groups it under the label's exact title. It reuses a matching group in that window. Chrome still asks for approval before creating the agent window for the first time.
+
+The package provides both `ubb` and `universal-browser-bridge` CLI names. From a checkout, use `node dist/cli.js` in place of `ubb`:
+
+```bash
+ubb --label Hephaestus browser_new_tab '{"url":"https://example.com"}'
+ubb --label Hephaestus browser_list_agent_tabs '{}'
+# Use the id from browser_new_tab, or tabId from browser_list_agent_tabs:
+ubb --label Hephaestus browser_close_tab '{"tabId":123}'
+```
+
+`browser_list_agent_tabs` returns `{tabId, url, title, groupId}` for each tab owned by the caller's label. `browser_status` and `browser_tabs` include hand-shared tabs and the caller's owned tabs. Every browser tool accepts owned tab IDs. Other labels, including clients without a label, cannot list, read, drive or close those tabs. A label is a caller-supplied identity: authenticated clients presenting the same label share ownership, even across separate CLI invocations or MCP sessions.
+
+Ownership is stored in [`chrome.storage.session`](https://developer.chrome.com/docs/extensions/reference/api/storage#property-session). It survives extension service-worker restarts and daemon/client reconnects within the Chrome session. Restarting Chrome, reloading/updating the extension, or disabling it clears session storage. Restoration reconciles closed tabs and tabs that have left their original group. Closing, ungrouping, moving a tab to another group, renaming its group, clicking the toolbar to unshare, or cancelling debugging revokes ownership. Merely placing an existing tab in a named group never grants an agent access to it.
+
+Without a label, `browser_new_tab` keeps the existing behavior: it creates a shared, unowned tab in **Agent Bridge**. All clients may read and drive it. While its creating client remains connected, only that client may close it; after disconnect it may be closed by another client. `browser_list_agent_tabs` requires a label. `browser_close_tab` also accepts hand-shared tabs legitimately controlled by the caller. Hand sharing still uses **Agent Bridge** and the **ON** badge.
+
+Consequential clicks and Enter still require the Chrome approval flow. Bank/payment URLs, including the initial URL of a newly created tab, allow snapshots, screenshots and scrolling, but block clicks, typing, key presses and navigation. The shared [URL policy](extension/url-policy.js) recognizes listed bank/payment domains (including HDFC, ICICI, SBI, Axis, Kotak, PayPal, Stripe and Razorpay), common banking/payment hostname labels, and `/checkout`, `/payment`, `/payments` or `/pay` path segments. It checks current and pending URLs before execution, including after approval waits. This is conservative URL classification, not an exhaustive bank directory. The private-network opt-in does not disable this protection.
+
 ## Annotations
 
 Share a normal HTTP(S) tab with the toolbar icon, then enter annotation mode with **Alt+Shift+A** (macOS: **Control+Shift+A**) or right-click the toolbar icon and choose **Annotate this tab**. The toolbar's normal click still toggles sharing. If the shortcut conflicts, change it at `chrome://extensions/shortcuts`.
@@ -276,10 +297,11 @@ Both commands use the authenticated daemon control socket, so **serve** must be 
 
 | Tool | Purpose |
 | --- | --- |
-| `browser_status` | Show extension connection state and shared tabs |
-| `browser_tabs` | List explicitly shared tabs |
-| `browser_new_tab` | Open an agent-owned tab in the dedicated agent window |
-| `browser_close_tab` | Close a tab owned by the calling adapter |
+| `browser_status` | Show extension connection state, shared tabs and caller-owned tabs |
+| `browser_tabs` | List shared tabs and caller-owned tabs |
+| `browser_new_tab` | Open a tab in the agent window, owned and grouped under the caller's label when supplied |
+| `browser_list_agent_tabs` | List the caller label's tabs as tabId, url, title and groupId |
+| `browser_close_tab` | Close a caller-owned tab or a tab otherwise legitimately shared with the caller |
 | `browser_snapshot` | Read compact interactive elements and receive a `snapshotId` |
 | `browser_navigate` | Navigate a shared tab to an allowed URL |
 | `browser_click` | Click a snapshot element, with approval when consequential |
@@ -339,7 +361,7 @@ Cross-compile by selecting a Bun target such as `bun-linux-x64`, `bun-windows-x6
 | `UBB_DATA_DIR` | `serve` | Annotation data root; defaults to `~/.universal-browser-bridge` |
 | `UBB_ANNOTATION_WEBHOOK_URL` | `serve` | Override and enable the annotation webhook URL; retain valid file headers |
 | `UBB_PORT` | `serve` | Extension WebSocket port; defaults to `17321` |
-| `UBB_CLIENT_LABEL` | `mcp` | Human-readable adapter identity shown in approvals and errors |
+| `UBB_CLIENT_LABEL` | `mcp`, CLI tools | Persistent agent ownership label, group title and approval identity; `--label` overrides it |
 | `UBB_ALLOW_PRIVATE_NETWORKS` | `mcp` | Set to `1` to allow localhost and private-network navigation |
 
 If you change `UBB_PORT`, update the extension Relay URL to match:
@@ -371,6 +393,14 @@ npm run build
 ```
 
 The test suite includes real local sockets and real subprocesses. It starts a daemon, multiple MCP adapters, and a fake extension WebSocket peer. No Chrome interaction is required.
+
+Restricted environments can run the socket-free tests, including the real extension/bridge/daemon/MCP ownership flow over mocked socket and Chrome boundaries:
+
+```bash
+npm test -- --exclude src/bridge.test.ts --exclude src/daemon.test.ts --exclude src/background-owner-race.test.ts --exclude src/cli-integration.test.ts
+```
+
+Those four files require local listeners, and the CLI integration also requires the `tsx` IPC socket. An `EPERM` listener failure is an environment restriction; the socket-free run does not replace real-socket or live Chrome acceptance.
 
 ### Live Chrome E2E
 

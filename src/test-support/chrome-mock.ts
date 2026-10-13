@@ -168,7 +168,10 @@ export function createChromeMock(options: { delays?: ChromeMockDelays } = {}) {
       },
       ungroup: async (tabId: number) => {
         const tab = tabsById.get(tabId);
-        if (tab) tab.groupId = -1;
+        if (tab) {
+          tab.groupId = -1;
+          for (const fn of tabsOnUpdated) fn(tabId, { groupId: -1 }, { ...tab });
+        }
       },
       onUpdated: { addListener: (fn: (typeof tabsOnUpdated)[number]) => tabsOnUpdated.push(fn) },
       onRemoved: { addListener: (fn: (typeof tabsOnRemoved)[number]) => tabsOnRemoved.push(fn) },
@@ -179,10 +182,11 @@ export function createChromeMock(options: { delays?: ChromeMockDelays } = {}) {
         "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aM1sAAAAASUVORK5CYII="
     },
     tabGroups: {
-      query: async ({ title, windowId }: { title: string; windowId: number }) =>
-        [...groupsById.values()].filter((g) => g.title === title && g.windowId === windowId).map((g) => ({ ...g })),
+      query: async ({ title, windowId }: { title?: string; windowId?: number }) =>
+        [...groupsById.values()].filter((g) => (title === undefined || g.title === title) && (windowId === undefined || g.windowId === windowId)).map((g) => ({ ...g })),
       get: async (id: number) => {
         await wait(d("tabGroupsGet", 0));
+        if (!groupsById.has(id)) throw new Error(`No group ${id}`);
         return { ...groupsById.get(id)! };
       },
       update: async (id: number, changes: Partial<MockGroup>) => {
@@ -201,7 +205,7 @@ export function createChromeMock(options: { delays?: ChromeMockDelays } = {}) {
       detach: async (_target: { tabId: number }) => {
         await wait(d("debuggerDetach", 0));
       },
-      sendCommand: async () => ({}),
+      sendCommand: async (_target: { tabId: number }, _method: string, _params: Record<string, unknown>): Promise<any> => ({}),
       onDetach: { addListener: (fn: (typeof debuggerOnDetach)[number]) => debuggerOnDetach.push(fn) }
     },
     action: {
@@ -240,5 +244,12 @@ export function createChromeMock(options: { delays?: ChromeMockDelays } = {}) {
     for (const fn of tabGroupsOnUpdated) fn({ ...group });
   }
 
-  return { chrome, simulateGroupRename, actionOnClicked, debuggerOnDetach, actionTitles, commandsOnCommand, contextMenusOnClicked, runtimeOnMessage, tabsOnUpdated, tabsById };
+  // A stopped MV3 worker loses listeners, while Chrome tabs and session
+  // storage survive. Re-evaluate background.js after this to test restoration.
+  function resetWorkerListeners(): void {
+    for (const listeners of [tabsOnUpdated, tabsOnRemoved, tabGroupsOnUpdated, actionOnClicked,
+      debuggerOnDetach, commandsOnCommand, contextMenusOnClicked, runtimeOnMessage]) listeners.length = 0;
+  }
+
+  return { chrome, simulateGroupRename, resetWorkerListeners, actionOnClicked, debuggerOnDetach, actionTitles, commandsOnCommand, contextMenusOnClicked, runtimeOnMessage, tabsOnUpdated, tabsById };
 }

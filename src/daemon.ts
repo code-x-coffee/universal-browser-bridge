@@ -9,6 +9,7 @@ import { isPotentiallyConsequential } from "./policy.js";
 import { PROTOCOL_VERSION, type AnnotationExtensionRequest, type ControlClientMessage, type ControlServerMessage, type SharedTab } from "./protocol.js";
 import { clickDetailsScript, clickScript, describeKey, scrollScript, snapshotScript, typeScript } from "./dom-actions.js";
 import { TabLeaseManager } from "./tab-lease.js";
+import { assertBrowserUrlAllowed, isReadOnlyBrowserUrl } from "./url-policy.js";
 
 type ControlRequest = Extract<ControlClientMessage, { type: "request" }>;
 
@@ -19,14 +20,14 @@ type ClientInfo = { socket: Socket; label?: string };
 // agent-window approval/creation flow at once.
 const CREATE_TAB_LOCK = -1;
 
-async function cdp(bridge: BrowserBridge, tabId: number, method: string, params: Record<string, unknown> = {}): Promise<any> {
-  return bridge.command({ action: "cdp", tabId, method, params });
+async function cdp(bridge: BrowserBridge, tabId: number, label: string | undefined, method: string, params: Record<string, unknown> = {}, requiresWritable = false): Promise<any> {
+  return bridge.command({ action: "cdp", tabId, label, method, params, requiresWritable });
 }
 
 // Runtime.evaluate reports page-script throws via exceptionDetails instead of
 // failing the CDP call outright, so surface those as real errors.
-async function evaluate(bridge: BrowserBridge, tabId: number, expression: string): Promise<unknown> {
-  const result = await cdp(bridge, tabId, "Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
+async function evaluate(bridge: BrowserBridge, tabId: number, label: string | undefined, expression: string, requiresWritable = false): Promise<unknown> {
+  const result = await cdp(bridge, tabId, label, "Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true }, requiresWritable);
   if (result?.exceptionDetails) {
     throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text ?? "Page script failed");
   }
@@ -224,6 +225,15 @@ export class DaemonServer {
     }
   }
 
+  private async assertWritableTab(tabId: number, label: string | undefined): Promise<void> {
+    // Read live Chrome state under the tab lease, including after an approval
+    // wait. Cached broadcasts can lag redirects or a user's navigation.
+    const tab = await this.bridge.command({ action: "getTab", tabId, label }) as { url: string; pendingUrl?: string };
+    if (isReadOnlyBrowserUrl(tab.url) || (tab.pendingUrl && isReadOnlyBrowserUrl(tab.pendingUrl))) {
+      throw new Error("Bank and payment pages are read-only; clicking, typing, key presses and navigation are disabled");
+    }
+  }
+
   // Requests human approval, labelled with the requesting adapter's
   // identity. Only called from inside a held tab lease (or the createTab
   // lock), so it is never something an adapter can trigger unilaterally or
@@ -236,9 +246,13 @@ export class DaemonServer {
 
   private async dispatch(message: ControlRequest, clientId: string): Promise<unknown> {
     const { action, tabId } = message;
+    const label = this.clients.get(clientId)?.label;
 
-    if (action === "status") return this.bridge.status();
-    if (action === "listTabs") return this.bridge.command({ action: "listTabs" });
+    if (action === "status") {
+      const status = this.bridge.status();
+      return { ...status, tabs: status.tabs.filter((tab) => !tab.ownerLabel || tab.ownerLabel === label) };
+    }
+    if (action === "listTabs" || action === "listAgentTabs") return this.bridge.command({ action, label });
     if (action === "annotationsList") return this.annotations.list({ url: message.url, status: message.status });
     if (action === "annotationsWebhookStatus") return this.webhook.status();
     if (action === "annotationsWebhookTest") return this.webhook.test();
@@ -263,8 +277,9 @@ export class DaemonServer {
 
     if (action === "createTab") {
       return this.leases.runExclusive(CREATE_TAB_LOCK, async () => {
-        const tab = (await this.bridge.command({ action: "createTab", url: message.url })) as { id: number };
-        this.tabOwners.set(tab.id, clientId);
+        if (!message.url || !assertBrowserUrlAllowed(message.url)) throw new Error("Only allowed public http(s) URLs can be opened");
+        const tab = (await this.bridge.command({ action: "createTab", url: message.url, label })) as { id: number };
+        if (!label) this.tabOwners.set(tab.id, clientId);
         this.knownTabIds.add(tab.id);
         return tab;
       });
@@ -272,15 +287,17 @@ export class DaemonServer {
 
     if (action === "closeTab") {
       if (tabId === undefined) throw new Error("tabId is required");
-      const owner = this.tabOwners.get(tabId);
-      if (owner && owner !== clientId) {
-        throw new Error(`Tab ${tabId} was created by another client (${this.requesterLabel(owner)}); only the owning client may close it.`);
-      }
-      const result = await this.bridge.command({ action: "closeTab", tabId });
-      this.tabOwners.delete(tabId);
-      this.knownTabIds.delete(tabId);
-      this.leases.forgetTab(tabId);
-      return result;
+      return this.leases.runExclusive(tabId, async () => {
+        const owner = this.tabOwners.get(tabId);
+        if (owner && owner !== clientId) {
+          throw new Error(`Tab ${tabId} was created by another client (${this.requesterLabel(owner)}); only the owning client may close it.`);
+        }
+        const result = await this.bridge.command({ action: "closeTab", tabId, label });
+        this.tabOwners.delete(tabId);
+        this.knownTabIds.delete(tabId);
+        this.leases.forgetTab(tabId);
+        return result;
+      });
     }
 
     if (tabId === undefined) throw new Error(`tabId is required for action "${action}"`);
@@ -288,7 +305,7 @@ export class DaemonServer {
 
     if (action === "snapshot") {
       return this.leases.runExclusive(tabId, async () => {
-        const result = (await evaluate(this.bridge, tabId, snapshotScript)) as Record<string, unknown>;
+        const result = (await evaluate(this.bridge, tabId, label, snapshotScript)) as Record<string, unknown>;
         return { ...result, snapshotId: snapshotId(tabId, this.leases.getGeneration(tabId)) };
       });
     }
@@ -300,9 +317,10 @@ export class DaemonServer {
       // or another click cannot slip in while a human is deciding, and a
       // stale/rejected click can never leave the lease stuck for others.
       return this.leases.runExclusive(tabId, async () => {
+        await this.assertWritableTab(tabId, label);
         this.assertGenerationCurrent(tabId, message.snapshotId);
         const ref = message.ref ?? "";
-        const details = (await evaluate(this.bridge, tabId, clickDetailsScript(ref))) as {
+        const details = (await evaluate(this.bridge, tabId, label, clickDetailsScript(ref))) as {
           text?: string;
           type?: string;
           href?: string;
@@ -313,21 +331,25 @@ export class DaemonServer {
           .join(" | ");
         if (isPotentiallyConsequential(actionSummary)) {
           await this.approve(clientId, `Allow click: ${actionSummary}`);
+          await this.assertWritableTab(tabId, label);
         }
-        return evaluate(this.bridge, tabId, clickScript(ref));
+        return evaluate(this.bridge, tabId, label, clickScript(ref), true);
       });
     }
 
     if (action === "type") {
       return this.leases.runExclusive(tabId, async () => {
+        await this.assertWritableTab(tabId, label);
         this.assertGenerationCurrent(tabId, message.snapshotId);
-        return evaluate(this.bridge, tabId, typeScript(message.ref ?? "", message.text ?? ""));
+        return evaluate(this.bridge, tabId, label, typeScript(message.ref ?? "", message.text ?? ""), true);
       });
     }
 
     if (action === "navigate") {
       return this.leases.runExclusive(tabId, async () => {
-        const result = await cdp(this.bridge, tabId, "Page.navigate", { url: message.url });
+        await this.assertWritableTab(tabId, label);
+        if (!message.url || !assertBrowserUrlAllowed(message.url)) throw new Error("Only allowed public http(s) URLs can be opened");
+        const result = await cdp(this.bridge, tabId, label, "Page.navigate", { url: message.url }, true);
         this.leases.bumpGeneration(tabId);
         return result;
       });
@@ -337,25 +359,27 @@ export class DaemonServer {
       // Same atomicity guarantee as click: the approval wait for Enter/
       // NumpadEnter and the actual key dispatch happen under one held lease.
       return this.leases.runExclusive(tabId, async () => {
+        await this.assertWritableTab(tabId, label);
         const key = message.key ?? "";
         if (/^(enter|numpadenter)$/i.test(key)) {
           await this.approve(clientId, `Allow ${key}? It may submit the current form.`);
+          await this.assertWritableTab(tabId, label);
         }
         const descriptor = describeKey(key);
         const params = { key, ...descriptor };
-        await cdp(this.bridge, tabId, "Input.dispatchKeyEvent", { type: params.text ? "keyDown" : "rawKeyDown", ...params });
-        await cdp(this.bridge, tabId, "Input.dispatchKeyEvent", { type: "keyUp", ...params });
+        await cdp(this.bridge, tabId, label, "Input.dispatchKeyEvent", { type: params.text ? "keyDown" : "rawKeyDown", ...params }, true);
+        await cdp(this.bridge, tabId, label, "Input.dispatchKeyEvent", { type: "keyUp", ...params }, true);
         return { pressed: key };
       });
     }
 
     if (action === "scroll") {
-      return this.leases.runExclusive(tabId, () => evaluate(this.bridge, tabId, scrollScript(message.deltaY ?? 0)));
+      return this.leases.runExclusive(tabId, () => evaluate(this.bridge, tabId, label, scrollScript(message.deltaY ?? 0)));
     }
 
     if (action === "screenshot") {
       return this.leases.runExclusive(tabId, async () => {
-        const result = await cdp(this.bridge, tabId, "Page.captureScreenshot", { format: "png" });
+        const result = await cdp(this.bridge, tabId, label, "Page.captureScreenshot", { format: "png" });
         if (!result?.data) throw new Error("Chrome did not return screenshot data");
         return result;
       });
