@@ -104,7 +104,7 @@ it("does not let another client close a tab that the extension's own group/title
   // wait -- it just needs to exceed the mock's own longest configured delay.
   await new Promise((resolve) => setTimeout(resolve, 150));
 
-  await expect(other.request({ action: "closeTab", tabId: created.id })).rejects.toThrow(/owning client|owner/i);
+  await expect(other.request({ action: "closeTab", tabId: created.id })).rejects.toThrow(/owned|owning client|owner/i);
 });
 
 it("still revokes sharing when a human later renames the tab's group away from Agent Bridge", async () => {

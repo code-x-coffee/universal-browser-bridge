@@ -14,9 +14,12 @@ const httpUrl = z
   });
 
 async function selectedTab(bridge: DaemonClient, requested?: number): Promise<number> {
+  // Explicit IDs are authorized by the daemon/extension, which can report a
+  // precise ownership error instead of hiding it behind a selection failure.
+  if (requested !== undefined) return requested;
   const status = await bridge.status();
-  const tab = requested ? status.tabs.find((item) => item.id === requested) : status.tabs.find((item) => item.active) ?? status.tabs[0];
-  if (!tab) throw new Error("No shared tab is available. Click the extension icon on a Chrome tab to share it.");
+  const tab = status.tabs.find((item) => item.active) ?? status.tabs[0];
+  if (!tab) throw new Error("No shared or agent-owned tab is available. Share a tab or call browser_new_tab.");
   return tab.id;
 }
 
@@ -27,10 +30,14 @@ function text(value: unknown) {
 export async function runMcpServer(bridge: DaemonClient, transport: Transport = new StdioServerTransport()): Promise<void> {
   const server = new McpServer({ name: "universal-browser-bridge", version: "0.1.0" });
 
-  server.tool("browser_status", "Show extension connection and explicitly shared tabs.", {}, async () => text(await bridge.status()));
+  server.tool("browser_status", "Show extension connection, shared tabs and tabs owned by your agent label.", {}, async () => text(await bridge.status()));
 
-  server.tool("browser_tabs", "List only the Chrome tabs explicitly shared with agents.", {}, async () =>
+  server.tool("browser_tabs", "List Chrome tabs shared with agents or owned by your agent label.", {}, async () =>
     text(await bridge.request({ action: "listTabs" }))
+  );
+
+  server.tool("browser_list_agent_tabs", "List tabs owned by your agent label, including tabId, url, title and groupId. Requires a label.", {}, async () =>
+    text(await bridge.request({ action: "listAgentTabs" }))
   );
 
   server.tool(
@@ -60,14 +67,14 @@ export async function runMcpServer(bridge: DaemonClient, transport: Transport = 
   );
   server.tool(
     "browser_new_tab",
-    "Open a tab in the dedicated agent window. Chrome asks for a one-time session grant before creating that window. Only this client may close the tab it creates.",
+    "Open a tab in the dedicated agent window. With a label, group and own the tab under that label across client invocations. Without a label, create an unowned shared tab. Chrome asks for a session grant before creating the window.",
     { url: httpUrl },
     async ({ url }) => text(await bridge.request({ action: "createTab", url }))
   );
 
   server.tool(
     "browser_close_tab",
-    "Close an agent-created tab that this client created. User-owned shared tabs, and tabs created by other clients, cannot be closed by this tool.",
+    "Close a tab owned by your agent label or otherwise shared with you. Tabs owned by other labels cannot be closed.",
     { tabId: z.number().int() },
     async ({ tabId }) => text(await bridge.request({ action: "closeTab", tabId }))
   );

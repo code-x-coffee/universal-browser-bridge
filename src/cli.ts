@@ -8,9 +8,18 @@ import { DaemonClient } from "./daemon-client.js";
 import { runMcpServer } from "./mcp.js";
 import { parseAnnotationArgs } from "./annotation-cli.js";
 import type { WebhookResult } from "./annotation-webhook.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
-const command = process.argv[2] ?? "help";
-const token = await getOrCreateToken();
+const args = process.argv.slice(2);
+let label = process.env.UBB_CLIENT_LABEL;
+if (args[0] === "--label") {
+  args.shift();
+  label = args.shift();
+  if (!label?.trim() || label.startsWith("--")) throw new Error("--label requires a non-empty agent name");
+}
+const command = args.shift() ?? "help";
+const token = command === "help" ? "" : await getOrCreateToken();
 
 if (command === "token") {
   process.stdout.write(`${token}\n`);
@@ -44,8 +53,8 @@ if (command === "token") {
 } else if (command === "annotations") {
   let client: DaemonClient | undefined;
   try {
-    const request = parseAnnotationArgs(process.argv.slice(3));
-    client = new DaemonClient({ socketPath: daemonSocketPath(), token, clientId: randomUUID(), label: process.env.UBB_CLIENT_LABEL });
+    const request = parseAnnotationArgs(args);
+    client = new DaemonClient({ socketPath: daemonSocketPath(), token, clientId: randomUUID(), label });
     await client.connect();
     const result = await client.request(request);
     process.stdout.write(JSON.stringify(result, null, 2) + "\n");
@@ -61,7 +70,7 @@ if (command === "token") {
     socketPath: daemonSocketPath(),
     token,
     clientId: randomUUID(),
-    label: process.env.UBB_CLIENT_LABEL
+    label
   });
   try {
     await client.connect();
@@ -70,6 +79,31 @@ if (command === "token") {
     process.exit(1);
   }
   await runMcpServer(client);
+} else if (/^(browser_|annotations_)/.test(command)) {
+  const client = new DaemonClient({ socketPath: daemonSocketPath(), token, clientId: randomUUID(), label });
+  const toolClient = new Client({ name: "ubb-cli", version: "0.1.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    if (args.length > 1) throw new Error("Expected one JSON object after the tool name");
+    const parameters = JSON.parse(args[0] ?? "{}");
+    if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) throw new Error("Tool arguments must be a JSON object");
+    await client.connect();
+    // Reuse MCP tool schemas and handlers, including all validation, rather
+    // than maintaining a second CLI-to-control-action mapping.
+    await runMcpServer(client, serverTransport);
+    await toolClient.connect(clientTransport);
+    const result = await toolClient.callTool({ name: command, arguments: parameters });
+    const content = result.content as Array<{ type: string; text?: string }>;
+    if (result.isError) throw new Error(content.filter((part) => part.type === "text").map((part) => part.text).join("\n"));
+    process.stdout.write((content.length === 1 && content[0]?.type === "text" ? content[0].text : JSON.stringify(result, null, 2)) + "\n");
+  } catch (error) {
+    process.stderr.write(`${(error as Error).message}\n`);
+    process.exitCode = 1;
+  } finally {
+    await toolClient.close();
+    await serverTransport.close();
+    await client.close();
+  }
 } else {
   process.stdout.write(
     `Universal Browser Bridge\n\n` +
@@ -77,13 +111,15 @@ if (command === "token") {
       `  serve  Start the daemon: owns the Chrome extension connection and the control socket\n` +
       `  mcp    Connect to a running daemon and start the MCP stdio server for one adapter\n` +
       `  token  Print the extension pairing token\n\n` +
+      `  [--label NAME] <browser_tool|annotations_tool> '<json>'\n` +
+      `  Example: ubb --label Hephaestus browser_list_agent_tabs '{}'\n\n` +
       `  annotations list [--url URL] [--status open|resolved|all] [--json]\n` +
       `  annotations get <id> | annotations get --url URL\n` +
       `  annotations resolve <id> [--note TEXT]\n` +
       `  annotations reply <id> --text TEXT [--author NAME]\n` +
       `  annotations webhook status|test\n\n` +
       `Env vars:\n` +
-      `  UBB_CLIENT_LABEL       Human-readable identity for this adapter (shown in approval prompts)\n` +
+      `  UBB_CLIENT_LABEL       Agent identity, ownership group and approval label (--label overrides it)\n` +
       `  UBB_SOCKET_PATH        Override the daemon control socket path\n` +
       `  UBB_DATA_DIR           Annotation data root (default ~/.universal-browser-bridge)\n` +
       `  UBB_ANNOTATION_WEBHOOK_URL  Override and enable the annotation webhook (serve only)\n` +

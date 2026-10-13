@@ -26,8 +26,14 @@ export function isPrivateNetworkUrl(value: string): boolean {
 }
 
 export function assertBrowserUrlAllowed(value: string): boolean {
-  const url = new URL(value);
-  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
-  if (process.env.UBB_ALLOW_PRIVATE_NETWORKS === "1" || process.env.UBB_ALLOW_PRIVATE_NETWORKS === "true") return true;
-  return !isPrivateNetworkUrl(value);
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+    if (process.env.UBB_ALLOW_PRIVATE_NETWORKS === "1" || process.env.UBB_ALLOW_PRIVATE_NETWORKS === "true") return true;
+    return !isPrivateNetworkUrl(value);
+  } catch {
+    return false;
+  }
 }
+
+export { isReadOnlyBrowserUrl } from "../extension/url-policy.js";

@@ -7,7 +7,11 @@ export type SharedTab = {
   title: string;
   url: string;
   active: boolean;
+  ownerLabel?: string;
+  groupId?: number;
 };
+
+export type AgentTab = { tabId: number; url: string; title: string; groupId: number };
 
 export type ExtensionMessage =
   | { type: "hello"; token: string; version: number }
@@ -26,10 +30,12 @@ export type AnnotationExtensionMessage =
 export type BridgeCommand = {
   type: "command";
   id: string;
-  action: "listTabs" | "createTab" | "closeTab" | "requestApproval" | "cdp";
+  action: "listTabs" | "listAgentTabs" | "getTab" | "createTab" | "closeTab" | "requestApproval" | "cdp";
+  label?: string;
   tabId?: number;
   method?: string;
   params?: Record<string, unknown>;
+  requiresWritable?: boolean;
   url?: string;
   description?: string;
 };
@@ -52,6 +58,7 @@ export type BridgeStatus = {
 export type ControlAction =
   | "status"
   | "listTabs"
+  | "listAgentTabs"
   | "createTab"
   | "closeTab"
   | "snapshot"

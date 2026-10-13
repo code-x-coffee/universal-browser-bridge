@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
+import type { SharedTab } from "./protocol.js";
 
 const PROJECT_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const TSX = join(PROJECT_ROOT, "node_modules", ".bin", "tsx");
@@ -19,7 +20,7 @@ const TSX = join(PROJECT_ROOT, "node_modules", ".bin", "tsx");
 class FakeExtension {
   ws!: WebSocket;
   private nextTabId = 1;
-  tabs: { id: number; title: string; url: string; active: boolean }[] = [];
+  tabs: SharedTab[] = [];
   updates: any[] = [];
 
   annotationRequest(body: Record<string, unknown>): Promise<any> {
@@ -54,12 +55,24 @@ class FakeExtension {
     if (message.type === "annotationUpdated") { this.updates.push(message.annotation); return; }
     if (message.type !== "command") return;
     const { id, action } = message;
-    if (action === "listTabs") return this.send({ type: "response", id, result: this.tabs });
+    if (action === "listTabs") return this.send({ type: "response", id, result: this.tabs.filter((tab) => !tab.ownerLabel || tab.ownerLabel === message.label) });
+    if (action === "listAgentTabs") {
+      if (!message.label) return this.send({ type: "response", id, error: "An agent label is required" });
+      return this.send({ type: "response", id, result: this.tabs.filter((tab) => tab.ownerLabel === message.label)
+        .map(({ id: tabId, url, title, groupId }) => ({ tabId, url, title, groupId })) });
+    }
     if (action === "createTab") {
-      const tab = { id: this.nextTabId++, title: "New Tab", url: message.url, active: true };
+      const tab = { id: this.nextTabId++, title: "New Tab", url: message.url, active: true,
+        ...(message.label ? { ownerLabel: message.label, groupId: 1 } : {}) };
       this.tabs.push(tab);
       this.send({ type: "tabs", tabs: this.tabs });
       return this.send({ type: "response", id, result: tab });
+    }
+    if (["getTab", "closeTab", "cdp"].includes(action)) {
+      const tab = this.tabs.find((tab) => tab.id === message.tabId);
+      if (!tab) return this.send({ type: "response", id, error: "Tab is not shared" });
+      if (tab.ownerLabel && tab.ownerLabel !== message.label) return this.send({ type: "response", id, error: `Tab is owned by ${tab.ownerLabel}` });
+      if (action === "getTab") return this.send({ type: "response", id, result: tab });
     }
     if (action === "closeTab") {
       this.tabs = this.tabs.filter((t) => t.id !== message.tabId);
@@ -229,7 +242,7 @@ describe("CLI serve + mcp (real processes, no Chrome)", () => {
       const tabId = newTab.id;
 
       const tabsFromB = JSON.parse(textOf(await clientB.callTool({ name: "browser_tabs", arguments: {} })));
-      expect(tabsFromB.some((t: any) => t.id === tabId)).toBe(true);
+      expect(tabsFromB.some((t: any) => t.id === tabId)).toBe(false);
 
       const snapshot = JSON.parse(textOf(await clientA.callTool({ name: "browser_snapshot", arguments: { tabId } })));
       expect(snapshot.snapshotId).toBe(`${tabId}:0`);
@@ -245,7 +258,7 @@ describe("CLI serve + mcp (real processes, no Chrome)", () => {
 
       const closeByB = await clientB.callTool({ name: "browser_close_tab", arguments: { tabId } });
       expect(closeByB.isError).toBe(true);
-      expect(textOf(closeByB)).toMatch(/owning client|owner/i);
+      expect(textOf(closeByB)).toMatch(/owned|owning client|owner/i);
 
       const closeByA = await clientA.callTool({ name: "browser_close_tab", arguments: { tabId } });
       expect(closeByA.isError).toBeFalsy();

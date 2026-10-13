@@ -1,9 +1,12 @@
+import { isReadOnlyBrowserUrl } from "./url-policy.js";
+
 const PROTOCOL_VERSION = 1;
 const DEFAULT_URL = "ws://127.0.0.1:17321/extension";
 const DEFAULT_ACTION_TITLE = "Share or unshare this tab with agents";
 const AGENT_GROUP_TITLE = "Agent Bridge";
 const sharedTabs = new Set();
 const agentTabs = new Set();
+const agentTabOwners = new Map();
 const pendingApprovals = new Map();
 const approvalWindows = new Map();
 let socket;
@@ -72,7 +75,7 @@ async function handleMessage(message) {
   if (message.type === "ready") {
     authenticated = true;
     setGlobalBadge("", "#0891b2");
-    await restoreSharedTabs();
+    await tabStateReady;
     await sendTabs();
     for (const tabId of sharedTabs) void refreshAnnotations(tabId).catch(() => {});
     return;
@@ -95,15 +98,35 @@ async function handleMessage(message) {
   }
   if (message.type !== "command") return;
   try {
+    await tabStateReady;
     let result;
-    if (message.action === "listTabs") result = await tabList();
+    if (message.action === "listTabs") result = (await tabList()).filter((tab) => !tab.ownerLabel || tab.ownerLabel === message.label);
+    if (message.action === "getTab") {
+      result = await assertControlledTab(message.tabId, message.label);
+    }
+    if (message.action === "listAgentTabs") {
+      if (!message.label) throw new Error("An agent label is required to list owned tabs");
+      result = (await tabList()).filter((tab) => tab.ownerLabel === message.label)
+        .map(({ id, url, title, groupId }) => ({ tabId: id, url, title, groupId }));
+    }
     if (message.action === "createTab") {
-      const tab = await createAgentTab(message.url);
-      await shareTab(tab.id);
-      result = tab;
+      const tab = await createAgentTab(message.url, message.label);
+      agentTabs.add(tab.id);
+      try {
+        await shareTab(tab.id, message.label);
+        if (!message.label) await persistAgentTabs();
+        result = await chrome.tabs.get(tab.id);
+      } catch (error) {
+        await unshareTab(tab.id, { ungroup: false }).catch(() => {});
+        await chrome.tabs.remove(tab.id).catch(() => {});
+        agentTabs.delete(tab.id);
+        agentTabOwners.delete(tab.id);
+        await persistAgentTabs().catch(() => {});
+        throw error;
+      }
     }
     if (message.action === "closeTab") {
-      if (!agentTabs.has(message.tabId)) throw new Error("Only agent-created tabs can be closed by agents");
+      await assertControlledTab(message.tabId, message.label);
       await unshareTab(message.tabId, { ungroup: false });
       await chrome.tabs.remove(message.tabId);
       agentTabs.delete(message.tabId);
@@ -114,7 +137,10 @@ async function handleMessage(message) {
       result = { approved: await requestApproval(message.description || "Allow this browser action?") };
     }
     if (message.action === "cdp") {
-      if (!sharedTabs.has(message.tabId)) throw new Error("Tab is not shared");
+      const tab = await assertControlledTab(message.tabId, message.label);
+      if (message.requiresWritable && (isReadOnlyBrowserUrl(tab.url) || (tab.pendingUrl && isReadOnlyBrowserUrl(tab.pendingUrl)))) {
+        throw new Error("Bank and payment pages are read-only");
+      }
       result = await chrome.debugger.sendCommand({ tabId: message.tabId }, message.method, message.params || {});
     }
     send({ type: "response", id: message.id, result });
@@ -123,33 +149,61 @@ async function handleMessage(message) {
   }
 }
 
-async function shareTab(tabId) {
+async function assertControlledTab(tabId, label) {
+  const owner = agentTabOwners.get(tabId);
+  if (owner && owner.label !== label) throw new Error(`Tab ${tabId} is owned by agent label "${owner.label}"`);
+  if (!sharedTabs.has(tabId)) throw new Error("Tab is not shared or owned by this agent");
+  if (groupingInProgress.has(tabId)) throw new Error("Tab sharing is still in progress");
+  if (!await isInAgentGroup(tabId)) {
+    await unshareTab(tabId, { ungroup: false });
+    throw new Error("Tab is no longer shared or owned by this agent");
+  }
+  const tab = await chrome.tabs.get(tabId);
+  if (!sharedTabs.has(tabId)) throw new Error("Tab is not shared or owned by this agent");
+  return tab;
+}
+
+async function shareTab(tabId, label) {
   if (!tabId || sharedTabs.has(tabId)) return;
   await chrome.debugger.attach({ tabId }, "1.3");
+  groupingInProgress.add(tabId);
   try {
+    if (label) agentTabOwners.set(tabId, { label, groupId: -1 });
     sharedTabs.add(tabId);
-    await chrome.storage.session.set({ sharedTabIds: [...sharedTabs] });
-    await ensureAgentGroup(tabId);
+    // Labelled tabs commit their access with finalized ownership below.
+    if (!label) await chrome.storage.session.set({ sharedTabIds: [...sharedTabs] });
+    const groupId = await ensureAgentGroup(tabId, label || AGENT_GROUP_TITLE);
+    if (label) {
+      agentTabOwners.set(tabId, { label, groupId });
+      await persistAgentTabs();
+    }
     await chrome.action.setBadgeText({ tabId, text: "ON" });
     await chrome.action.setBadgeBackgroundColor({ tabId, color: "#0891b2" });
     await chrome.action.setTitle({ tabId, title: DEFAULT_ACTION_TITLE }).catch(() => {});
+    groupingInProgress.delete(tabId);
     await sendTabs();
     void refreshAnnotations(tabId).catch(() => {});
   } catch (error) {
+    const inside = await isInAgentGroup(tabId);
     sharedTabs.delete(tabId);
+    if (agentTabOwners.delete(tabId)) await persistAgentTabs().catch(() => {});
     await chrome.storage.session.set({ sharedTabIds: [...sharedTabs] }).catch(() => {});
     intentionalDetach.add(tabId);
     await chrome.debugger.detach({ tabId }).catch(() => {});
     intentionalDetach.delete(tabId);
     await chrome.action.setBadgeText({ tabId, text: "" }).catch(() => {});
-    if (await isInAgentGroup(tabId)) await chrome.tabs.ungroup(tabId).catch(() => {});
+    if (inside) await chrome.tabs.ungroup(tabId).catch(() => {});
     throw error;
+  } finally {
+    groupingInProgress.delete(tabId);
   }
 }
 
-async function unshareTab(tabId, { ungroup = true } = {}) {
+async function unshareTab(tabId, { ungroup = true, notify = true } = {}) {
   if (!sharedTabs.has(tabId)) return;
+  const inside = ungroup && await isInAgentGroup(tabId);
   sharedTabs.delete(tabId);
+  if (agentTabOwners.delete(tabId)) await persistAgentTabs();
   await chrome.tabs.sendMessage(tabId, { type: "ubbAnnotationsDestroy" }).catch(() => {});
   intentionalDetach.add(tabId);
   await chrome.debugger.detach({ tabId }).catch(() => {});
@@ -157,14 +211,15 @@ async function unshareTab(tabId, { ungroup = true } = {}) {
   await chrome.storage.session.set({ sharedTabIds: [...sharedTabs] });
   await chrome.action.setBadgeText({ tabId, text: "" });
   await chrome.action.setTitle({ tabId, title: DEFAULT_ACTION_TITLE }).catch(() => {});
-  if (ungroup && await isInAgentGroup(tabId)) await chrome.tabs.ungroup(tabId).catch(() => {});
-  await sendTabs();
+  if (inside) await chrome.tabs.ungroup(tabId).catch(() => {});
+  if (notify) await sendTabs();
 }
 
-async function restoreSharedTabs() {
+async function restoreSharedTabs(revokedOwnedTabIds = new Set()) {
   const { sharedTabIds = [] } = await chrome.storage.session.get({ sharedTabIds: [] });
   for (const tabId of sharedTabIds) {
     try {
+      if (revokedOwnedTabIds.has(tabId)) throw new Error("Agent ownership was revoked while the worker was stopped");
       await chrome.tabs.get(tabId);
       if (!await isInAgentGroup(tabId)) throw new Error("Tab left the Agent Bridge group");
       await chrome.debugger.attach({ tabId }, "1.3").catch((error) => {
@@ -175,59 +230,46 @@ async function restoreSharedTabs() {
       await chrome.action.setBadgeBackgroundColor({ tabId, color: "#0891b2" });
     } catch {
       sharedTabs.delete(tabId);
+      agentTabOwners.delete(tabId);
+      intentionalDetach.add(tabId);
+      await chrome.debugger.detach({ tabId }).catch(() => {});
+      intentionalDetach.delete(tabId);
     }
   }
   await chrome.storage.session.set({ sharedTabIds: [...sharedTabs] });
+  await persistAgentTabs();
 }
 
 // Agent-created tabs live in their own window so they never crowd the user's.
-async function createAgentTab(url) {
+async function createAgentTab(url, label) {
   const { agentWindowId } = await chrome.storage.session.get("agentWindowId");
   if (agentWindowId !== undefined) {
-    try {
-      await chrome.windows.get(agentWindowId);
-      const tab = await chrome.tabs.create({ windowId: agentWindowId, url, active: false });
-      agentTabs.add(tab.id);
-      await persistAgentTabs();
-      return tab;
-    } catch {
-      // Agent window was closed; create a fresh one below.
+    const window = await chrome.windows.get(agentWindowId).catch(() => undefined);
+    if (window) {
+      return chrome.tabs.create({ windowId: agentWindowId, url, active: false });
     }
   }
   const approved = await requestApproval(
-    `Create an agent-controlled Chrome window? Tabs opened there can use your signed-in Chrome session. First URL: ${url}`
+    `${label ? `[${label}] ` : ""}Create an agent-controlled Chrome window? Tabs opened there can use your signed-in Chrome session. First URL: ${url}`
   );
   if (!approved) throw new Error("User denied creation of the agent-controlled window");
   const window = await chrome.windows.create({ url, focused: false });
   await chrome.storage.session.set({ agentWindowId: window.id });
-  const tab = window.tabs[0];
-  agentTabs.add(tab.id);
-  await persistAgentTabs();
-  return tab;
+  return window.tabs[0];
 }
 
-async function ensureAgentGroup(tabId) {
-  // Tab groups are per-window: reuse the Agent Bridge group in this tab's own
-  // window so grouping never drags a tab across windows.
-  //
-  // chrome.tabs.group() and the chrome.tabGroups.update() that titles the
-  // group are two separate round trips. chrome.tabs.onUpdated (and
-  // chrome.tabGroups.onUpdated) can fire and be fully handled in between,
-  // so a listener reacting to *this* grouping can observe the group before
-  // its title is set. Track tabs we're actively (re)grouping so those
-  // listeners can tell "still being grouped by us" apart from "left the
-  // group" and not misfire an unshare on a tab we just shared.
-  groupingInProgress.add(tabId);
-  try {
-    const tab = await chrome.tabs.get(tabId);
-    const groups = await chrome.tabGroups.query({ title: AGENT_GROUP_TITLE, windowId: tab.windowId });
-    const groupId = groups[0]
-      ? await chrome.tabs.group({ tabIds: [tabId], groupId: groups[0].id })
-      : await chrome.tabs.group({ tabIds: [tabId], createProperties: { windowId: tab.windowId } });
-    await chrome.tabGroups.update(groupId, { title: AGENT_GROUP_TITLE, color: "cyan", collapsed: false });
-  } finally {
-    groupingInProgress.delete(tabId);
-  }
+async function ensureAgentGroup(tabId, title = AGENT_GROUP_TITLE) {
+  // Reuse the exact title in this window without moving tabs across windows.
+  // shareTab holds groupingInProgress across setup, persistence and badges,
+  // since Chrome's events are not ordered against these API-call promises.
+  const tab = await chrome.tabs.get(tabId);
+  // Chrome's title query is a pattern; compare titles literally for labels.
+  const groups = (await chrome.tabGroups.query({ windowId: tab.windowId })).filter((group) => group.title === title);
+  const groupId = groups[0]
+    ? await chrome.tabs.group({ tabIds: [tabId], groupId: groups[0].id })
+    : await chrome.tabs.group({ tabIds: [tabId], createProperties: { windowId: tab.windowId } });
+  await chrome.tabGroups.update(groupId, { title, color: "cyan", collapsed: false });
+  return groupId;
 }
 
 async function isInAgentGroup(tabId) {
@@ -235,7 +277,8 @@ async function isInAgentGroup(tabId) {
     const tab = await chrome.tabs.get(tabId);
     if (tab.groupId === undefined || tab.groupId < 0) return false;
     const group = await chrome.tabGroups.get(tab.groupId);
-    return group.title === AGENT_GROUP_TITLE;
+    const owner = agentTabOwners.get(tabId);
+    return owner ? tab.groupId === owner.groupId && group.title === owner.label : group.title === AGENT_GROUP_TITLE;
   } catch {
     return false;
   }
@@ -263,11 +306,21 @@ function scheduleRevocationCheck(tabId) {
 }
 
 async function persistAgentTabs() {
-  await chrome.storage.session.set({ agentTabIds: [...agentTabs] });
+  // Persist access and ownership together so a worker stopping mid-revocation
+  // cannot restore an owned tab as an unowned, universally shared tab.
+  await chrome.storage.session.set({ agentTabIds: [...agentTabs], agentTabOwners: [...agentTabOwners], sharedTabIds: [...sharedTabs] });
 }
 
 async function restoreAgentTabs() {
-  const { agentTabIds = [] } = await chrome.storage.session.get({ agentTabIds: [] });
+  const revokedOwnedTabIds = new Set();
+  const { agentTabIds = [], agentTabOwners: owners = [] } = await chrome.storage.session.get({ agentTabIds: [], agentTabOwners: [] });
+  for (const [tabId, owner] of owners) {
+    agentTabOwners.set(tabId, owner);
+    if (!await isInAgentGroup(tabId)) {
+      agentTabOwners.delete(tabId);
+      revokedOwnedTabIds.add(tabId);
+    }
+  }
   for (const tabId of agentTabIds) {
     try {
       await chrome.tabs.get(tabId);
@@ -276,7 +329,7 @@ async function restoreAgentTabs() {
       agentTabs.delete(tabId);
     }
   }
-  await persistAgentTabs();
+  return revokedOwnedTabIds;
 }
 
 async function requestApproval(description) {
@@ -310,11 +363,19 @@ function finishApproval(id, approved) {
 async function tabList() {
   const tabs = [];
   for (const id of sharedTabs) {
+    if (groupingInProgress.has(id)) continue;
     try {
       const tab = await chrome.tabs.get(id);
-      tabs.push({ id, title: tab.title || "", url: tab.url || "", active: Boolean(tab.active) });
+      if (!await isInAgentGroup(id)) {
+        await unshareTab(id, { ungroup: false, notify: false });
+        continue;
+      }
+      const owner = agentTabOwners.get(id);
+      tabs.push({ id, title: tab.title || "", url: tab.url || "", active: Boolean(tab.active),
+        ...(owner ? { ownerLabel: owner.label, groupId: tab.groupId } : {}) });
     } catch {
       sharedTabs.delete(id);
+      if (agentTabOwners.delete(id)) await persistAgentTabs();
     }
   }
   return tabs;
@@ -455,6 +516,8 @@ chrome.action.onClicked.addListener(async (tab) => {
 chrome.debugger.onDetach.addListener(({ tabId }) => {
   if (intentionalDetach.has(tabId)) return;
   sharedTabs.delete(tabId);
+  agentTabOwners.delete(tabId);
+  void persistAgentTabs();
   void chrome.tabs.sendMessage(tabId, { type: "ubbAnnotationsDestroy" }).catch(() => {});
   chrome.storage.session.set({ sharedTabIds: [...sharedTabs] });
   chrome.action.setBadgeText({ tabId, text: "" }).catch(() => {});
@@ -465,6 +528,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   tabGenerations.delete(tabId);
   sharedTabs.delete(tabId);
   agentTabs.delete(tabId);
+  agentTabOwners.delete(tabId);
   chrome.storage.session.set({ sharedTabIds: [...sharedTabs] });
   void persistAgentTabs();
   void sendTabs();
@@ -517,4 +581,5 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && (changes.token || changes.relayUrl)) void connect();
 });
 
-void restoreAgentTabs().then(connect);
+const tabStateReady = restoreAgentTabs().then(restoreSharedTabs);
+void tabStateReady.then(connect);
