@@ -1,6 +1,6 @@
 import { normalizeBlockedDomains } from "./url-policy.js";
 import { DEFAULT_UPLOAD_FOLDERS, normalizeUploadFolders } from "./upload-policy.js";
-import { DEFAULT_DOWNLOAD_FOLDERS, normalizeDownloadFolders, normalizeTrustedDownloadHosts } from "./download-policy.js";
+import { DEFAULT_DOWNLOAD_FOLDERS, normalizeDownloadFolders, normalizeTrustedDownloadHosts, validateTrustedDownloadHost } from "./download-policy.js";
 
 const relayUrl = document.querySelector("#relayUrl");
 const token = document.querySelector("#token");
@@ -43,7 +43,10 @@ document.querySelector("#savePolicy").addEventListener("click", async () => {
     const ignoredDownloads = downloadEntries.filter((entry) => entry.trim() && !normalizeDownloadFolders([entry]).length).length;
     const hostEntries = trustedDownloadHosts.value.split(/\r?\n/);
     const hosts = normalizeTrustedDownloadHosts(hostEntries);
-    const ignoredHosts = hostEntries.filter((entry) => entry.trim() && !normalizeTrustedDownloadHosts([entry]).length).length;
+    const ignoredHosts = hostEntries.flatMap((entry) => {
+      const result = validateTrustedDownloadHost(entry);
+      return entry.trim() && result.error ? [{ entry: entry.trim(), error: result.error }] : [];
+    });
     const domains = normalizeBlockedDomains(blockedDomains.value.split(/\r?\n/));
     await chrome.storage.local.set({ trustAgentOwnedTabs: trustAgentOwnedTabs.checked, autoCreateAgentWindow: autoCreateAgentWindow.checked, blockedDomains: domains });
     blockedDomains.value = domains.join("\n");
@@ -56,7 +59,11 @@ document.querySelector("#savePolicy").addEventListener("click", async () => {
     policyStatus.textContent = "Saved. Safety settings apply immediately.";
     if (ignored) policyStatus.textContent += ` Ignored ${ignored} invalid upload folder ${ignored === 1 ? "entry" : "entries"}.`;
     if (ignoredDownloads) policyStatus.textContent += ` Ignored ${ignoredDownloads} invalid download folder ${ignoredDownloads === 1 ? "entry" : "entries"}.`;
-    if (ignoredHosts) policyStatus.textContent += ` Ignored ${ignoredHosts} invalid trusted download host ${ignoredHosts === 1 ? "entry" : "entries"}.`;
+    for (const { entry, error } of ignoredHosts.slice(0, 3)) {
+      const preview = entry.length > 80 ? entry.slice(0, 77) + "..." : entry;
+      policyStatus.textContent += ` Ignored ${JSON.stringify(preview)}: ${error}.`;
+    }
+    if (ignoredHosts.length > 3) policyStatus.textContent += ` ${ignoredHosts.length - 3} more invalid trusted download host entries ignored.`;
   } catch (error) {
     policyStatus.textContent = error.message || String(error);
   }

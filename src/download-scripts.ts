@@ -1,4 +1,4 @@
-import { assertDownloadUrl } from "../extension/download-policy.js";
+import { assertDownloadUrl, isTrustedDownloadHost, normalizeTrustedDownloadHosts, validateTrustedDownloadHost } from "../extension/download-policy.js";
 import { MAX_DOWNLOAD_BYTES } from "./download-policy.js";
 
 export function downloadSourceScript(source: { ref?: string; url?: string }): string {
@@ -18,7 +18,11 @@ export function downloadSourceScript(source: { ref?: string; url?: string }): st
 
 export function downloadFetchScript(key: string, url: string): string {
   return `(async () => {
-    const url = (${assertDownloadUrl.toString()})(${JSON.stringify(url)}, location.href);
+    const validateTrustedDownloadHost = ${validateTrustedDownloadHost.toString()};
+    const normalizeTrustedDownloadHosts = ${normalizeTrustedDownloadHosts.toString()};
+    const isTrustedDownloadHost = ${isTrustedDownloadHost.toString()};
+    const assertDownloadUrl = ${assertDownloadUrl.toString()};
+    const url = assertDownloadUrl(${JSON.stringify(url)}, location.href);
     const key = ${JSON.stringify(key)};
     const store = window.__ubbDl ??= Object.create(null);
     const entry = { controller: new AbortController(), blob: null };
@@ -34,7 +38,7 @@ export function downloadFetchScript(key: string, url: string): string {
         return { redirected: true };
       }
       if (!response.ok) throw new Error('Download fetch failed (HTTP ' + response.status + ')');
-      if (response.url) (${assertDownloadUrl.toString()})(response.url, location.href);
+      if (response.url) assertDownloadUrl(response.url, location.href);
       const length = Number(response.headers.get('content-length'));
       if (length > ${MAX_DOWNLOAD_BYTES}) throw new Error('Download exceeds the 500 MB limit');
       const blob = await response.blob();

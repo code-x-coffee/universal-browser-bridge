@@ -63,6 +63,12 @@ it("refuses redirects and HTTP failures and clears page state", async () => {
   await expect(run(downloadFetchScript("key", "https://app.example/media"))).rejects.toThrow(/404/);
   expect(Object.keys(page.__ubbDl ?? {})).toEqual([]);
 });
+it("rechecks the response host in the embedded page fallback and cleans up on refusal", async () => {
+  fetchPage.mockResolvedValue({ ok: true, status: 200, url: "https://googlevideo.com.evil.net/private?token=secret#fragment" });
+  await expect(run(downloadFetchScript("key", "https://app.example/media")))
+    .rejects.toThrow('Download host googlevideo.com.evil.net is not a trusted download host; add it under "Trusted download hosts" in Extension options');
+  expect(Object.keys(page.__ubbDl ?? {})).toEqual([]);
+});
 it("releases an abandoned page blob with a safety timer", async () => {
   await run(downloadFetchScript("key", "https://app.example/media"));
   await vi.advanceTimersByTimeAsync(120000);
