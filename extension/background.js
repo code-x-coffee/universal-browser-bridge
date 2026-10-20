@@ -1,4 +1,5 @@
 import { isReadOnlyBrowserUrl, normalizeBlockedDomains, isBlockedBrowserUrl, assertTabNotBlocked } from "./url-policy.js";
+import { DEFAULT_UPLOAD_FOLDERS, normalizeUploadFolders } from "./upload-policy.js";
 
 const PROTOCOL_VERSION = 1;
 const DEFAULT_URL = "ws://127.0.0.1:17321/extension";
@@ -34,10 +35,17 @@ async function settings() {
   return { ...saved, blockedDomains: normalizeBlockedDomains(saved.blockedDomains) };
 }
 
+// Kept apart from settings() so the upload policy can evolve independently.
+async function uploadSettings() {
+  const { uploadFolders } = await chrome.storage.local.get({ uploadFolders: DEFAULT_UPLOAD_FOLDERS });
+  return { uploadFolders: normalizeUploadFolders(uploadFolders) };
+}
+
 async function connect() {
   authenticated = false;
   clearTimeout(reconnectTimer);
   const { relayUrl, token, blockedDomains } = await settings();
+  const { uploadFolders } = await uploadSettings();
   if (!token) {
     setGlobalBadge("?", "#b45309");
     return;
@@ -47,7 +55,7 @@ async function connect() {
   socket = connection;
   connection.addEventListener("open", () => {
     if (socket !== connection) return;
-    connection.send(JSON.stringify({ type: "hello", token, version: PROTOCOL_VERSION, blockedDomains }));
+    connection.send(JSON.stringify({ type: "hello", token, version: PROTOCOL_VERSION, blockedDomains, uploadFolders }));
     // Regular WebSocket traffic keeps the MV3 service worker alive (Chrome 116+
     // resets the 30s idle timer on each message).
     clearInterval(keepaliveTimer);
@@ -155,6 +163,7 @@ async function handleMessage(message) {
       assertTabNotBlocked(tab, blockedDomains);
       if (message.method === "Page.navigate") assertTabNotBlocked({ url: message.params?.url }, blockedDomains);
       if (message.requiresWritable) assertWritableTab(tab);
+      if (message.method === "DOM.setFileInputFiles") await assertFileUploadAllowed(message, tab);
       result = await chrome.debugger.sendCommand({ tabId: message.tabId }, message.method, message.params || {});
     }
     send({ type: "response", id: message.id, result });
@@ -170,7 +179,32 @@ async function assertUnblockedTab(tab) {
 
 async function sendSitePolicy() {
   const { blockedDomains } = await settings();
-  if (authenticated) send({ type: "sitePolicy", blockedDomains });
+  const { uploadFolders } = await uploadSettings();
+  if (authenticated) send({ type: "sitePolicy", blockedDomains, uploadFolders });
+}
+
+async function assertFileUploadAllowed(message, tab) {
+  if (!message.label || agentTabOwners.get(message.tabId)?.label !== message.label) {
+    throw new Error("File uploads require a tab owned by your agent label; hand-shared tabs cannot upload files");
+  }
+  const { blockedDomains } = await settings();
+  const { uploadFolders } = await uploadSettings();
+  assertTabNotBlocked(tab, blockedDomains);
+  assertWritableTab(tab);
+  if (!uploadFolders.length) {
+    throw new Error("File uploads are disabled: no allowed upload folders are configured in Extension options");
+  }
+  const files = message.params?.files;
+  if (!Array.isArray(files) || files.length < 1 || files.length > 10) throw new Error("File uploads require 1..10 files");
+  for (const file of files) {
+    if (typeof file !== "string" || !file.startsWith("/") || file.includes("\0") || file.split("/").includes("..")
+      || !uploadFolders.some((folder) => file.startsWith(folder))) {
+      throw new Error(`Upload file ${String(file)} is outside the allowed upload folders`);
+    }
+  }
+  if (chrome.extension?.isAllowedFileSchemeAccess && !await chrome.extension.isAllowedFileSchemeAccess()) {
+    throw new Error('Enable "Allow access to file URLs" for Universal Browser Bridge in chrome://extensions');
+  }
 }
 
 function assertWritableTab(tab) {
@@ -618,7 +652,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && (changes.token || changes.relayUrl)) void connect();
-  if (area === "local" && changes.blockedDomains) void sendSitePolicy().then(sendTabs);
+  if (area === "local" && (changes.blockedDomains || changes.uploadFolders)) void sendSitePolicy().then(sendTabs);
 });
 
 const tabStateReady = restoreAgentTabs().then(restoreSharedTabs);

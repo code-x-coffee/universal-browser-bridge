@@ -10,7 +10,7 @@ export const snapshotScript = String.raw`
     const rect = el.getBoundingClientRect();
     return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
   };
-  const nodes = [...document.querySelectorAll('a,button,input,textarea,select,[role],[contenteditable="true"]')]
+  const nodes = [...document.querySelectorAll('a,button,input,label,textarea,select,[role],[contenteditable="true"]')]
     .filter(visible)
     .slice(0, 250)
     .map((el, index) => {
@@ -47,6 +47,25 @@ export function typeScript(ref: string, input: string): string {
 
 export function scrollScript(deltaY: number): string {
   return `window.scrollBy({top:${deltaY},behavior:'instant'}); ({x:scrollX,y:scrollY})`;
+}
+
+export function uploadFileScript(ref: string, fileCount: number): string {
+  return `(() => {
+    const el = document.querySelector(${JSON.stringify(`[data-ubb-ref="${ref}"]`)});
+    if (!el) throw new Error('Element ref expired; take a new snapshot');
+    const isFileInput = (node) => node?.matches('input[type="file"]');
+    let input;
+    if (isFileInput(el)) input = el;
+    else if (el.tagName === 'LABEL' && isFileInput(el.control)) input = el.control;
+    else {
+      const inputs = el.querySelectorAll('input[type="file"]');
+      if (inputs.length === 1) input = inputs[0];
+    }
+    if (!input) throw new Error('Target is not a file input (or a label/button containing one)');
+    if (input.disabled || input.matches(':disabled')) throw new Error('File input is disabled');
+    if (${fileCount} > 1 && !input.multiple) throw new Error('File input does not allow multiple files');
+    return input;
+  })()`;
 }
 
 const KEY_DESCRIPTORS: Record<string, { code: string; windowsVirtualKeyCode: number; text?: string }> = {

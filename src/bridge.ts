@@ -5,6 +5,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { PROTOCOL_VERSION, type AnnotationExtensionMessage, type BridgeCommand, type BridgeStatus, type ExtensionMessage, type SharedTab } from "./protocol.js";
 import { tokensMatch } from "./auth.js";
 import { normalizeBlockedDomains } from "./url-policy.js";
+import { normalizeUploadFolders } from "./upload-policy.js";
 
 type Pending = { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout };
 
@@ -18,6 +19,7 @@ export class BrowserBridge extends EventEmitter {
   private server?: ReturnType<typeof createServer>;
   private boundPort = 0;
   private siteBlocklist: string[] = [];
+  private allowedUploadFolders: string[] = [];
 
   constructor(
     private readonly token: string,
@@ -33,6 +35,10 @@ export class BrowserBridge extends EventEmitter {
 
   get blockedDomains(): readonly string[] {
     return this.siteBlocklist;
+  }
+
+  get uploadFolders(): readonly string[] {
+    return this.allowedUploadFolders;
   }
 
   async start(): Promise<void> {
@@ -123,6 +129,7 @@ export class BrowserBridge extends EventEmitter {
         clearTimeout(authTimer);
         this.extension?.close(4409, "Replaced by a newer extension connection");
         this.extension = ws;
+        this.allowedUploadFolders = normalizeUploadFolders(message.uploadFolders);
         ws.send(JSON.stringify({ type: "ready", version: PROTOCOL_VERSION }));
         ws.send(JSON.stringify({ type: "command", id: randomUUID(), action: "listTabs" }));
         return;
@@ -131,6 +138,7 @@ export class BrowserBridge extends EventEmitter {
       // A replaced authenticated peer must not mutate the current session.
       if (this.extension !== ws) return;
       if (message.type === "sitePolicy") {
+        this.allowedUploadFolders = normalizeUploadFolders(message.uploadFolders);
         try {
           this.siteBlocklist = normalizeBlockedDomains(message.blockedDomains);
         } catch {
@@ -165,6 +173,7 @@ export class BrowserBridge extends EventEmitter {
       clearTimeout(authTimer);
       if (this.extension === ws) {
         this.extension = undefined;
+        this.allowedUploadFolders = [];
         this.tabs = [];
         this.emit("tabs", this.tabs);
         for (const [id, pending] of this.pending) {

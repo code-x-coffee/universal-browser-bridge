@@ -61,3 +61,38 @@ it("reports an invalid domain without overwriting the saved policy", async () =>
   expect(await mock.chrome.storage.local.get(["trustAgentOwnedTabs", "blockedDomains"]))
     .toEqual({ trustAgentOwnedTabs: false, blockedDomains: ["example.com"] });
 });
+
+it("shows the default upload folder only when the key is unset", async () => {
+  await load();
+  expect(field("uploadFolders")?.value).toBe("/Volumes/NVme/Projects/Stories/");
+});
+
+it("preserves an explicitly empty upload folder list", async () => {
+  await load({ uploadFolders: [] });
+  expect(field("uploadFolders")?.value).toBe("");
+});
+
+it("saves normalized upload folders and reports ignored entries", async () => {
+  await load();
+  field("uploadFolders").value = " /tmp/images \r\nrelative\n/tmp/images/\n/tmp/a/../b\n/tmp/other/";
+  await field("savePolicy").events.get("click")!();
+  expect(await mock.chrome.storage.local.get("uploadFolders")).toEqual({ uploadFolders: ["/tmp/images/", "/tmp/other/"] });
+  expect(field("uploadFolders").value).toBe("/tmp/images/\n/tmp/other/");
+  expect(field("policyStatus").textContent).toMatch(/ignored.*2/i);
+});
+
+it("saves an empty textarea as an empty array to disable uploads", async () => {
+  await load();
+  field("uploadFolders").value = "\n ";
+  await field("savePolicy").events.get("click")!();
+  expect(await mock.chrome.storage.local.get("uploadFolders")).toEqual({ uploadFolders: [] });
+});
+
+it("does not save upload folders when a blocklist entry is invalid", async () => {
+  await load({ uploadFolders: ["/saved/"] });
+  field("blockedDomains").value = "not a domain";
+  field("uploadFolders").value = "/new/";
+  await field("savePolicy").events.get("click")!();
+  expect(await mock.chrome.storage.local.get("uploadFolders")).toEqual({ uploadFolders: ["/saved/"] });
+  expect(field("policyStatus").textContent).toMatch(/invalid.*domain/i);
+});
