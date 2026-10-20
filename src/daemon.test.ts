@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
 import { BrowserBridge } from "./bridge.js";
 import { DaemonServer } from "./daemon.js";
@@ -168,6 +168,7 @@ afterEach(async () => {
   extension?.close();
   await daemon?.stop();
   await bridge?.stop();
+  vi.restoreAllMocks();
   await rm(tempDir, { recursive: true, force: true });
 });
 
@@ -356,6 +357,102 @@ describe("DaemonServer + DaemonClient", () => {
 
     expect(extension.maxConcurrentCreateTab).toBe(1);
     expect(tabA.id).not.toBe(tabB.id);
+  });
+
+  it("drops a queued createTab when its requesting client disconnects", async () => {
+    const a = makeClient("client-a");
+    const b = makeClient("client-b");
+    await a.connect();
+    await b.connect();
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const command = bridge.command.bind(bridge);
+    const commands = vi.spyOn(bridge, "command").mockImplementation(async (message) => {
+      if (message.action === "createTab") await pending;
+      return command(message);
+    });
+
+    const first = a.request({ action: "createTab", url: "https://example.com/a" });
+    await vi.waitFor(() => expect(commands).toHaveBeenCalledTimes(1));
+    const abandoned = expect(b.request({ action: "createTab", url: "https://example.com/abandoned" }))
+      .rejects.toThrow(/connection closed/i);
+    // A later request on the same socket confirms the createTab is queued.
+    await b.status();
+    await b.close();
+    await abandoned;
+    await vi.waitFor(() => expect((daemon as any).clients.size).toBe(1));
+
+    release();
+    const tab = await first as { id: number };
+    expect(commands.mock.calls.filter(([message]) => message.action === "createTab")).toEqual([
+      [{ action: "createTab", url: "https://example.com/a", label: "client-a" }]
+    ]);
+    expect((await a.status()).tabs.map(({ id }) => id)).toEqual([tab.id]);
+  });
+
+  it.each([undefined, "client-a"])("closes an in-flight orphan before the next queued createTab (label=%s)", async (label) => {
+    const a = makeClient(label);
+    const b = makeClient("client-b");
+    await a.connect();
+    await b.connect();
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const command = bridge.command.bind(bridge);
+    const commands = vi.spyOn(bridge, "command").mockImplementation(async (message) => {
+      if (message.action === "createTab" && message.url === "https://example.com/orphan") await pending;
+      return command(message);
+    });
+
+    const abandoned = expect(a.request({ action: "createTab", url: "https://example.com/orphan" }))
+      .rejects.toThrow(/connection closed/i);
+    await vi.waitFor(() => expect(commands).toHaveBeenCalledTimes(1));
+    const next = b.request({ action: "createTab", url: "https://example.com/b" });
+    await b.status();
+    await a.close();
+    await abandoned;
+    await vi.waitFor(() => expect((daemon as any).clients.size).toBe(1));
+
+    release();
+    const tab = await next as { id: number };
+    expect(commands.mock.calls.filter(([message]) => ["createTab", "closeTab"].includes(message.action))).toEqual([
+      [{ action: "createTab", url: "https://example.com/orphan", label }],
+      [{ action: "closeTab", tabId: 1, label }],
+      [{ action: "createTab", url: "https://example.com/b", label: "client-b" }]
+    ]);
+    expect(extension.tabs.map(({ id }) => id)).toEqual([tab.id]);
+  });
+
+  it("releases the createTab lock without recording ownership if closing an orphan fails", async () => {
+    const a = makeClient();
+    const b = makeClient();
+    await a.connect();
+    await b.connect();
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const command = bridge.command.bind(bridge);
+    const commands = vi.spyOn(bridge, "command").mockImplementation(async (message) => {
+      if (message.action === "createTab" && message.url === "https://example.com/orphan") await pending;
+      return command(message);
+    });
+
+    const abandoned = expect(a.request({ action: "createTab", url: "https://example.com/orphan" }))
+      .rejects.toThrow(/connection closed/i);
+    await vi.waitFor(() => expect(commands).toHaveBeenCalledTimes(1));
+    const next = b.request({ action: "createTab", url: "https://example.com/b" });
+    await b.status();
+    await a.close();
+    await abandoned;
+    await vi.waitFor(() => expect((daemon as any).clients.size).toBe(1));
+    commands.mockImplementationOnce(async (message) => {
+      expect(message).toEqual({ action: "closeTab", tabId: 1, label: undefined });
+      throw new Error("Chrome refused orphan cleanup");
+    });
+
+    release();
+    await expect(next).resolves.toMatchObject({ id: 2 });
+    // A failed best-effort close must not leave the departed client's
+    // legacy ownership attached to the orphan.
+    await expect(b.request({ action: "closeTab", tabId: 1 })).resolves.toEqual({ closed: 1 });
   });
 
   // --- Finding 2: ownership release on disconnect + reconciliation of stale tab state ---

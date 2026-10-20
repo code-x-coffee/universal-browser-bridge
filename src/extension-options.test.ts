@@ -28,36 +28,40 @@ beforeEach(() => {
 });
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
-it("shows trust enabled and an empty blocklist on first use", async () => {
+it("enables trust and automatic agent windows with an empty blocklist on first use", async () => {
   await load();
   expect(field("trustAgentOwnedTabs")?.checked).toBe(true);
+  expect(field("autoCreateAgentWindow")?.checked).toBe(true);
   expect(field("blockedDomains")?.value).toBe("");
 });
 
-it("loads the saved trust preference and blocklist", async () => {
-  await load({ trustAgentOwnedTabs: false, blockedDomains: ["example.com", "vault.example.org"] });
+it("loads the saved trust and agent window preferences and blocklist", async () => {
+  await load({ trustAgentOwnedTabs: false, autoCreateAgentWindow: false, blockedDomains: ["example.com", "vault.example.org"] });
   expect(field("trustAgentOwnedTabs").checked).toBe(false);
+  expect(field("autoCreateAgentWindow")?.checked).toBe(false);
   expect(field("blockedDomains").value).toBe("example.com\nvault.example.org");
 });
 
-it("saves normalized domains and the trust checkbox without changing pairing settings", async () => {
+it.each([true, false])("saves normalized domains and safety checkboxes (automatic windows=%s) without changing pairing settings", async (autoCreate) => {
   await load({ relayUrl: "ws://127.0.0.1:17322/extension", token: "saved-token" });
   field("trustAgentOwnedTabs").checked = false;
+  field("autoCreateAgentWindow").checked = autoCreate;
   field("blockedDomains").value = "HTTPS://WWW.Example.COM/path\r\n\nexample.com\nvault.example.org/private";
   await field("savePolicy").events.get("click")!();
-  expect(await mock.chrome.storage.local.get(["trustAgentOwnedTabs", "blockedDomains", "relayUrl", "token"]))
-    .toEqual({ trustAgentOwnedTabs: false, blockedDomains: ["example.com", "vault.example.org"],
+  expect(await mock.chrome.storage.local.get(["trustAgentOwnedTabs", "autoCreateAgentWindow", "blockedDomains", "relayUrl", "token"]))
+    .toEqual({ trustAgentOwnedTabs: false, autoCreateAgentWindow: autoCreate, blockedDomains: ["example.com", "vault.example.org"],
       relayUrl: "ws://127.0.0.1:17322/extension", token: "saved-token" });
   expect(field("blockedDomains").value).toBe("example.com\nvault.example.org");
   expect(field("policyStatus").textContent).toMatch(/saved/i);
 });
 
 it("reports an invalid domain without overwriting the saved policy", async () => {
-  await load({ trustAgentOwnedTabs: false, blockedDomains: ["example.com"] });
+  await load({ trustAgentOwnedTabs: false, autoCreateAgentWindow: false, blockedDomains: ["example.com"] });
   field("blockedDomains").value = "not a domain";
   field("trustAgentOwnedTabs").checked = true;
+  field("autoCreateAgentWindow").checked = true;
   await field("savePolicy").events.get("click")!();
   expect(field("policyStatus").textContent).toMatch(/invalid.*domain/i);
-  expect(await mock.chrome.storage.local.get(["trustAgentOwnedTabs", "blockedDomains"]))
-    .toEqual({ trustAgentOwnedTabs: false, blockedDomains: ["example.com"] });
+  expect(await mock.chrome.storage.local.get(["trustAgentOwnedTabs", "autoCreateAgentWindow", "blockedDomains"]))
+    .toEqual({ trustAgentOwnedTabs: false, autoCreateAgentWindow: false, blockedDomains: ["example.com"] });
 });

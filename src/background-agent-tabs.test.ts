@@ -242,7 +242,7 @@ it("does not restore an interrupted labelled creation as an unowned shared tab",
 
 it.each([true, false])("refuses blocked new tabs before creation or approval (agent window exists=%s)", async (hasWindow) => {
   if (!hasWindow) await mock.chrome.storage.session.remove("agentWindowId");
-  await mock.chrome.storage.local.set({ blockedDomains: ["https://WWW.Example.com/private"] });
+  await mock.chrome.storage.local.set({ autoCreateAgentWindow: true, blockedDomains: ["https://WWW.Example.com/private"] });
   const tabs = vi.spyOn(mock.chrome.tabs, "create");
   const windows = vi.spyOn(mock.chrome.windows, "create");
   const response = await command({ action: "createTab", url: "https://login.example.com/", label: "Hephaestus" });
@@ -251,9 +251,22 @@ it.each([true, false])("refuses blocked new tabs before creation or approval (ag
   expect(windows).not.toHaveBeenCalled();
 });
 
-it("always asks before creating the first agent window even with owned-tab trust on", async () => {
+it.each([undefined, true])("creates the first agent window without a prompt (automatic windows=%s)", async (autoCreateAgentWindow) => {
   await mock.chrome.storage.session.remove("agentWindowId");
-  await mock.chrome.storage.local.set({ trustAgentOwnedTabs: true });
+  if (autoCreateAgentWindow !== undefined) await mock.chrome.storage.local.set({ autoCreateAgentWindow });
+  const windows = vi.spyOn(mock.chrome.windows, "create");
+  FakeSocket.instance.deliver({ type: "command", id: "first-window", action: "createTab", label: "Hephaestus", url: "https://example.com/" });
+  await settle();
+  const response = FakeSocket.instance.messages.find((message) => message.id === "first-window");
+  expect(response?.error).toBeUndefined();
+  expect(response?.result).toMatchObject({ url: "https://example.com/" });
+  expect(windows.mock.calls).toEqual([[{ url: "https://example.com/", focused: false }]]);
+  expect(await mock.chrome.storage.session.get("agentWindowId")).toEqual({ agentWindowId: response.result.windowId });
+});
+
+it.each([false, true])("uses the approval flow when automatic agent windows are disabled (approved=%s)", async (approved) => {
+  await mock.chrome.storage.session.remove("agentWindowId");
+  await mock.chrome.storage.local.set({ trustAgentOwnedTabs: true, autoCreateAgentWindow: false });
   const windows = vi.spyOn(mock.chrome.windows, "create");
   FakeSocket.instance.deliver({ type: "command", id: "first-window", action: "createTab", label: "Hephaestus", url: "https://example.com/" });
   await settle();
@@ -262,13 +275,40 @@ it("always asks before creating the first agent window even with owned-tab trust
   const popup = windows.mock.calls[0]![0];
   expect(popup.url).toContain("approval.html");
   const id = new URL(popup.url).searchParams.get("id")!;
+  for (const listener of mock.runtimeOnMessage) listener({ type: "approvalDecision", id, approved }, {}, () => {});
+  await settle();
+  const response = FakeSocket.instance.messages.find((message) => message.id === "first-window");
+  if (approved) {
+    expect(response.error).toBeUndefined();
+    expect(response.result.url).toBe("https://example.com/");
+    expect(windows.mock.calls[1]).toEqual([{ url: "https://example.com/", focused: false }]);
+    expect(windows).toHaveBeenCalledTimes(2);
+  } else {
+    expect(response.error).toMatch(/denied/i);
+    expect(windows).toHaveBeenCalledTimes(1);
+    expect(await mock.chrome.storage.session.get("agentWindowId")).toEqual({ agentWindowId: undefined });
+  }
+});
+
+it("reads the automatic window setting live after it changes", async () => {
+  await mock.chrome.storage.session.remove("agentWindowId");
+  await mock.chrome.storage.local.set({ autoCreateAgentWindow: false });
+  const windows = vi.spyOn(mock.chrome.windows, "create");
+  FakeSocket.instance.deliver({ type: "command", id: "denied-window", action: "createTab", label: "Hephaestus", url: "https://example.com/" });
+  await settle();
+  const id = new URL(windows.mock.calls[0]![0].url).searchParams.get("id")!;
   for (const listener of mock.runtimeOnMessage) listener({ type: "approvalDecision", id, approved: false }, {}, () => {});
   await settle();
-  expect(FakeSocket.instance.messages.find((message) => message.id === "first-window").error).toMatch(/denied/i);
+  expect(FakeSocket.instance.messages.find((message) => message.id === "denied-window").error).toMatch(/denied/i);
+  await mock.chrome.storage.local.set({ autoCreateAgentWindow: true });
+  windows.mockClear();
+  await create("Hephaestus");
+  expect(windows.mock.calls).toEqual([[{ url: "https://example.com/", focused: false }]]);
 });
 
 it("rechecks the blocklist after approval before creating an agent window", async () => {
   await mock.chrome.storage.session.remove("agentWindowId");
+  await mock.chrome.storage.local.set({ autoCreateAgentWindow: false });
   const windows = vi.spyOn(mock.chrome.windows, "create");
   FakeSocket.instance.deliver({ type: "command", id: "first-window", action: "createTab", label: "Hephaestus", url: "https://example.com/" });
   await settle();

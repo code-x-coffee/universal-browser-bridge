@@ -190,7 +190,7 @@ Chrome internal pages, extension pages, password-manager prompts, passkeys, nati
 
 ### Agent-owned tabs
 
-Set `UBB_CLIENT_LABEL` for an MCP adapter, or pass `--label` to the CLI. A labelled `browser_new_tab` creates a tab in the dedicated agent window and groups it under the label's exact title. It reuses a matching group in that window. Chrome still asks for approval before creating the agent window for the first time.
+Set `UBB_CLIENT_LABEL` for an MCP adapter, or pass `--label` to the CLI. A labelled `browser_new_tab` creates a tab in the dedicated agent window and groups it under the label's exact title. It reuses a matching group in that window. By default, the agent window is created without a prompt and without taking focus. Chrome asks first only if you turn off **Let agents open their window without asking** in Extension options.
 
 The package provides both `ubb` and `universal-browser-bridge` CLI names. From a checkout, use `node dist/cli.js` in place of `ubb`:
 
@@ -207,11 +207,15 @@ Ownership is stored in [`chrome.storage.session`](https://developer.chrome.com/d
 
 Without a label, `browser_new_tab` keeps the existing behavior: it creates a shared, unowned tab in **Agent Bridge**. All clients may read and drive it. While its creating client remains connected, only that client may close it; after disconnect it may be closed by another client. `browser_list_agent_tabs` requires a label. `browser_close_tab` also accepts hand-shared tabs legitimately controlled by the caller. Hand sharing still uses **Agent Bridge** and the **ON** badge.
 
+Tab creation requests are serialized. If a requesting client disconnects while its request is queued, the daemon drops the request. If it disconnects while Chrome is creating the tab, the daemon attempts to close the orphan before processing the next request, without recording ownership. Cleanup is best effort; if Chrome refuses the close, the tab may remain open.
+
 ### Trust and site safety settings
 
-Open **Extension options** to change **Trust agent-owned tabs** or **Blocked sites**, then click **Save safety settings**. Both settings are stored in `chrome.storage.local` and apply immediately without restarting the daemon.
+Open **Extension options** to change **Trust agent-owned tabs**, **Let agents open their window without asking**, or **Blocked sites**, then click **Save safety settings**. These settings are stored in `chrome.storage.local` and apply immediately without restarting the daemon.
 
-**Trust agent-owned tabs** defaults to enabled (`trustAgentOwnedTabs: true` when unset). Consequential clicks and Enter/NumpadEnter skip the approval popup only when the extension confirms that the target tab is currently owned by the calling label. Turn it off to require approval in owned tabs too. Hand-shared and unlabelled tabs always retain the approval flow, and creating the first agent window always requires approval. Clients cannot override the setting with a request flag. Labels remain caller-supplied identities, so authenticated clients using the same label share that trust.
+**Trust agent-owned tabs** defaults to enabled (`trustAgentOwnedTabs: true` when unset). Consequential clicks and Enter/NumpadEnter skip the approval popup only when the extension confirms that the target tab is currently owned by the calling label. Turn it off to require approval in owned tabs too. Hand-shared and unlabelled tabs always retain the approval flow for these actions. Clients cannot override the setting with a request flag. Labels remain caller-supplied identities, so authenticated clients using the same label share that trust.
+
+**Let agents open their window without asking** defaults to enabled (`autoCreateAgentWindow: true` when unset). When no live agent window exists, the extension creates one with `focused: false` without an approval popup. Turn it off to require approval before creating the window; opening more tabs in an existing agent window does not prompt. The extension reads the setting for each window creation. With this setting on, any local process holding the bridge token can open agent tabs in your signed-in Chrome without a prompt.
 
 Bank, card, payment and password-manager URLs, including the initial URL of a newly created tab, allow snapshots, screenshots and scrolling, but block clicks, typing, key presses and navigation even with trust enabled. The shared [URL policy](extension/url-policy.js) recognizes listed financial domains (including HDFC, ICICI, SBI, Axis, Kotak, PayPal, Stripe, Razorpay, American Express, Discover, Capital One, Visa and Mastercard), password managers (1Password, Bitwarden, LastPass, Dashlane, Keeper, Google Password Manager, NordPass and Proton Pass), common banking/payment hostname labels, and `/checkout`, `/payment`, `/payments` or `/pay` path segments. It checks current and pending URLs before execution, including after approval waits. Proton's `/pass` pages and `pass.proton.me` are protected without making its other pages read-only. This is conservative URL classification, not an exhaustive sensitive-site directory. The private-network opt-in does not disable it.
 
@@ -445,7 +449,7 @@ Then set the extension Relay URL to:
 ws://127.0.0.1:17322/extension
 ```
 
-The test never approves Chrome prompts itself. If Chrome asks to create the agent-controlled window, approve it manually.
+The agent-controlled window opens without a prompt by default. If you turned off **Let agents open their window without asking**, approve the window creation manually; the test never approves Chrome prompts itself.
 
 ## Troubleshooting
 
@@ -529,7 +533,8 @@ Chrome assigns unpacked extensions an identity based partly on their loaded dire
 - Navigation and new tabs accept only allowed `http:` and `https:` URLs.
 - Localhost and private-network destinations are blocked unless explicitly enabled.
 - Consequential clicks and Enter presses require Chrome-hosted human approval unless the extension's trust setting is enabled and the live tab belongs to the caller's label.
-- Creating the agent window always requires approval; bank, card, payment and password-manager pages always remain read-only.
+- Creating the agent window requires approval only when **Let agents open their window without asking** is turned off. It is enabled by default, so any local process holding the bridge token can open agent tabs in the signed-in Chrome without a prompt.
+- Bank, card, payment and password-manager pages always remain read-only, regardless of either trust or automatic window creation settings.
 - Blocklisted domains and their subdomains refuse all page operations in owned and hand-shared tabs, with current and pending URL checks in both the daemon and extension.
 - The model cannot approve its own request.
 - Agent-created tabs belong to their creating adapter while it is connected.
