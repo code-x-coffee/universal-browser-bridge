@@ -1,4 +1,5 @@
 import { unlink } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import type { BrowserBridge } from "./bridge.js";
@@ -6,15 +7,20 @@ import { tokensMatch } from "./auth.js";
 import { AnnotationStore } from "./annotations.js";
 import { AnnotationWebhook } from "./annotation-webhook.js";
 import { isPotentiallyConsequential } from "./policy.js";
-import { PROTOCOL_VERSION, type AnnotationExtensionRequest, type ControlClientMessage, type ControlServerMessage, type SharedTab } from "./protocol.js";
+import { PROTOCOL_VERSION, type AnnotationExtensionRequest, type ControlClientMessage, type ControlServerMessage, type SharedTab, type ExtensionDiagnostic } from "./protocol.js";
+import { log } from "./log.js";
 import { clickDetailsScript, clickTargetScript, clickScript, describeKey, scrollScript, snapshotScript, typeScript, uploadFileScript } from "./dom-actions.js";
 import { TabLeaseManager } from "./tab-lease.js";
 import { assertBrowserUrlAllowed, isReadOnlyBrowserUrl, assertTabNotBlocked, isBlockedBrowserUrl } from "./url-policy.js";
 import { validateUploadFiles } from "./upload-policy.js";
+import { assertDownloadSource, prepareDownloadDestination, saveDownload } from "./download-policy.js";
+import { assertDownloadUrl } from "../extension/download-policy.js";
+import { downloadSourceScript, downloadFetchScript, downloadChunkScript, downloadCleanupScript } from "./download-scripts.js";
 
 type ControlRequest = Extract<ControlClientMessage, { type: "request" }>;
 
 type ClientInfo = { socket: Socket; label?: string; connected: boolean };
+type ClickTarget = { x: number; y: number; hasSize: boolean; visible: boolean; hitTarget: boolean };
 
 // Sentinel lease key: serializes createTab calls (which have no tabId yet)
 // so adapters cannot race the agent-window creation/optional approval flow.
@@ -30,11 +36,13 @@ async function getUnblockedTab(bridge: BrowserBridge, tabId: number, label: stri
   return tab;
 }
 
-async function cdp(bridge: BrowserBridge, tabId: number, label: string | undefined, method: string, params: Record<string, unknown> = {}, requiresWritable = false): Promise<any> {
+async function cdp(bridge: BrowserBridge, tabId: number, label: string | undefined, method: string, params: Record<string, unknown> = {}, requiresWritable = false, options: { downloadFolder?: string; timeoutMs?: number } = {}): Promise<any> {
   if (method === "Page.navigate") assertTabNotBlocked({ url: params.url as string }, bridge.blockedDomains);
   const tab = await getUnblockedTab(bridge, tabId, label);
   if (requiresWritable) assertTabWritable(tab);
-  return bridge.command({ action: "cdp", tabId, label, method, params, requiresWritable });
+  if (options.downloadFolder !== undefined && !bridge.downloadFolders.includes(options.downloadFolder)) throw new Error("Download folder is no longer in the allowed download folders");
+  return bridge.command({ action: "cdp", tabId, label, method, params, requiresWritable,
+    ...(options.downloadFolder === undefined ? {} : { downloadFolder: options.downloadFolder }) }, options.timeoutMs);
 }
 
 function assertTabWritable(tab: { url: string; pendingUrl?: string }): void {
@@ -45,10 +53,10 @@ function assertTabWritable(tab: { url: string; pendingUrl?: string }): void {
 
 // Runtime.evaluate reports page-script throws via exceptionDetails instead of
 // failing the CDP call outright, so surface those as real errors.
-async function evaluate(bridge: BrowserBridge, tabId: number, label: string | undefined, expression: string, options: { requiresWritable?: boolean; userGesture?: boolean } = {}): Promise<unknown> {
+async function evaluate(bridge: BrowserBridge, tabId: number, label: string | undefined, expression: string, options: { requiresWritable?: boolean; userGesture?: boolean; downloadFolder?: string; timeoutMs?: number } = {}): Promise<unknown> {
   const result = await cdp(bridge, tabId, label, "Runtime.evaluate", {
     expression, returnByValue: true, awaitPromise: true, userGesture: options.userGesture
-  }, options.requiresWritable);
+  }, options.requiresWritable, options);
   if (result?.exceptionDetails) {
     throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text ?? "Page script failed");
   }
@@ -78,8 +86,11 @@ export class DaemonServer {
   ) {
     // Reconcile ownership/lease state for tabs that vanish out-of-band (the
     // user closes them directly in Chrome, or the extension disconnects).
-    this.bridge.on("tabs", (tabs: SharedTab[]) => this.reconcileTabs(tabs));
+    this.bridge.on("tabs", this.handleTabs);
     this.bridge.on("annotations", this.handleAnnotations);
+    this.bridge.on("connected", this.handleConnected);
+    this.bridge.on("disconnected", this.handleDisconnected);
+    this.bridge.on("diagnostic", this.handleDiagnostic);
   }
 
   async start(): Promise<void> {
@@ -90,12 +101,21 @@ export class DaemonServer {
   }
 
   async stop(): Promise<void> {
+    this.bridge.off("tabs", this.handleTabs);
     this.bridge.off("annotations", this.handleAnnotations);
+    this.bridge.off("connected", this.handleConnected);
+    this.bridge.off("disconnected", this.handleDisconnected);
+    this.bridge.off("diagnostic", this.handleDiagnostic);
     for (const client of this.clients.values()) client.socket.destroy();
     this.clients.clear();
     await new Promise<void>((resolve) => (this.server ? this.server.close(() => resolve()) : resolve()));
     if (process.platform !== "win32") await unlink(this.socketPath).catch(() => {});
   }
+
+  private handleTabs = (tabs: SharedTab[]): void => this.reconcileTabs(tabs);
+  private handleConnected = (): void => log("Chrome extension connected");
+  private handleDisconnected = (): void => log("Chrome extension disconnected");
+  private handleDiagnostic = (message: ExtensionDiagnostic): void => log(`Extension diagnostic: ${JSON.stringify(message)}`);
 
   private handleAnnotations = async (message: AnnotationExtensionRequest): Promise<void> => {
     try {
@@ -111,7 +131,7 @@ export class DaemonServer {
         this.bridge.sendAnnotations({ type: "annotationUpdated", annotation });
         // Detach delivery (including synchronous throws) from the committed save.
         void Promise.resolve().then(() => this.webhook.created(annotation)).catch(() => {
-          process.stderr.write("Annotation webhook: delivery error\n");
+          log("Annotation webhook: delivery error");
         });
       }
     } catch (error) {
@@ -163,6 +183,12 @@ export class DaemonServer {
         this.knownTabIds.delete(id);
         this.tabOwners.delete(id);
         this.leases.forgetTab(id);
+      }
+    }
+    for (const tab of tabs) {
+      if (tab.ownerLabel && !this.knownTabIds.has(tab.id)) {
+        this.knownTabIds.add(tab.id);
+        log(`Tab ownership restored: tabId=${tab.id} label=${JSON.stringify(tab.ownerLabel)}`);
       }
     }
   }
@@ -266,6 +292,19 @@ export class DaemonServer {
     if (!result?.approved) throw new Error(`User denied browser action: ${description}`);
   }
 
+  private async approveClickIfNeeded(clientId: string, tabId: number, message: ControlRequest): Promise<void> {
+    const label = this.clients.get(clientId)?.label;
+    const details = (await evaluate(this.bridge, tabId, label, clickDetailsScript(message.ref ?? ""))) as {
+      text?: string; type?: string; href?: string; formAction?: string;
+    };
+    const actionSummary = [message.description, details.text, details.type, details.href, details.formAction]
+      .filter(Boolean).join(" | ");
+    if (isPotentiallyConsequential(actionSummary)) {
+      await this.approve(clientId, tabId, `Allow click: ${actionSummary}`);
+      await this.assertWritableTab(tabId, label);
+    }
+  }
+
   private async dispatch(message: ControlRequest, clientId: string): Promise<unknown> {
     const { action, tabId } = message;
     const client = this.clients.get(clientId);
@@ -354,22 +393,8 @@ export class DaemonServer {
         await this.assertWritableTab(tabId, label);
         this.assertGenerationCurrent(tabId, message.snapshotId);
         const ref = message.ref ?? "";
-        const details = (await evaluate(this.bridge, tabId, label, clickDetailsScript(ref))) as {
-          text?: string;
-          type?: string;
-          href?: string;
-          formAction?: string;
-        };
-        const actionSummary = [message.description, details.text, details.type, details.href, details.formAction]
-          .filter(Boolean)
-          .join(" | ");
-        if (isPotentiallyConsequential(actionSummary)) {
-          await this.approve(clientId, tabId, `Allow click: ${actionSummary}`);
-          await this.assertWritableTab(tabId, label);
-        }
-        const target = (await evaluate(this.bridge, tabId, label, clickTargetScript(ref), { requiresWritable: true })) as {
-          x: number; y: number; hasSize: boolean; visible: boolean; hitTarget: boolean;
-        };
+        await this.approveClickIfNeeded(clientId, tabId, message);
+        const target = (await evaluate(this.bridge, tabId, label, clickTargetScript(ref), { requiresWritable: true })) as ClickTarget;
         if (target.hasSize && target.visible && target.hitTarget) {
           const { x, y } = target;
           await cdp(this.bridge, tabId, label, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y }, true);
@@ -390,8 +415,43 @@ export class DaemonServer {
       });
     }
 
+    if (action === "download") {
+      return this.leases.runExclusive(tabId, async () => {
+        assertDownloadSource(message);
+        if (typeof message.description !== "string" || !message.description.trim()) throw new Error("A description is required for downloads");
+        if (typeof label !== "string" || !label.trim()) throw new Error("An agent label is required for downloads");
+        const ownedTabs = await this.bridge.command({ action: "listAgentTabs", label });
+        if (!Array.isArray(ownedTabs) || !ownedTabs.some((tab) => tab.tabId === tabId)) throw new Error("Downloads require a tab owned by your agent label; hand-shared tabs cannot download files");
+        const tab = await getUnblockedTab(this.bridge, tabId, label);
+        assertTabWritable(tab);
+        if (message.ref !== undefined) this.assertGenerationCurrent(tabId, message.snapshotId);
+        if (message.url !== undefined) assertDownloadUrl(message.url, tab.url);
+        const destination = await prepareDownloadDestination(message, this.bridge.downloadFolders);
+        const options = { requiresWritable: true, downloadFolder: destination.folder };
+        const source = await evaluate(this.bridge, tabId, label, downloadSourceScript({ ref: message.ref, url: message.url }), options);
+        const live = await getUnblockedTab(this.bridge, tabId, label);
+        const url = assertDownloadUrl(source, live.url);
+        const key = randomUUID();
+        try {
+          const metadata = (await evaluate(this.bridge, tabId, label, downloadFetchScript(key, url), {
+            ...options, userGesture: true, timeoutMs: 125_000
+          })) as { size: number; mimeType: string };
+          if (!metadata || typeof metadata.mimeType !== "string") throw new Error("Chrome did not return download metadata");
+          const saved = await saveDownload(destination, metadata.size, (offset, length) =>
+            evaluate(this.bridge, tabId, label, downloadChunkScript(key, offset, length), options));
+          return { saved, bytes: metadata.size, mimeType: metadata.mimeType };
+        } finally {
+          // A page timer also expires entries if the connection or tab policy
+          // prevents this cleanup command from reaching the original document.
+          await evaluate(this.bridge, tabId, label, downloadCleanupScript(key), options).catch(() => {});
+        }
+      });
+    }
+
     if (action === "uploadFile") {
       return this.leases.runExclusive(tabId, async () => {
+        const mode = message.mode ?? "auto";
+        if (!["auto", "input", "chooser"].includes(mode)) throw new Error("Upload mode must be auto, input or chooser");
         if (typeof label !== "string" || !label.trim()) throw new Error("An agent label is required for file uploads");
         const ownedTabs = await this.bridge.command({ action: "listAgentTabs", label });
         if (!Array.isArray(ownedTabs) || !ownedTabs.some((tab) => tab.tabId === tabId)) {
@@ -400,23 +460,33 @@ export class DaemonServer {
         await this.assertWritableTab(tabId, label);
         this.assertGenerationCurrent(tabId, message.snapshotId);
         const realPaths = await validateUploadFiles(message.files, this.bridge.uploadFolders);
-        const target = await cdp(this.bridge, tabId, label, "Runtime.evaluate", {
-          expression: uploadFileScript(message.ref ?? "", realPaths.length), returnByValue: false
-        }, true);
-        if (target?.exceptionDetails) {
-          throw new Error(target.exceptionDetails.exception?.description ?? target.exceptionDetails.text ?? "Page script failed");
-        }
-        const objectId = target?.result?.objectId;
-        if (typeof objectId !== "string" || !objectId) throw new Error("Chrome did not return a file input objectId");
-        try {
-          await cdp(this.bridge, tabId, label, "DOM.setFileInputFiles", { files: realPaths, objectId }, true);
-        } catch (error) {
-          if (/not allowed/i.test((error as Error).message)) {
-            throw new Error(`${(error as Error).message}. Enable "Allow access to file URLs" for Universal Browser Bridge in chrome://extensions`);
+        if (mode !== "chooser") {
+          const target = await cdp(this.bridge, tabId, label, "Runtime.evaluate", {
+            expression: uploadFileScript(message.ref ?? "", realPaths.length, mode === "auto"), returnByValue: false
+          }, true);
+          if (target?.exceptionDetails) {
+            throw new Error(target.exceptionDetails.exception?.description ?? target.exceptionDetails.text ?? "Page script failed");
           }
-          throw error;
+          if (target?.result?.subtype !== "null") {
+            const objectId = target?.result?.objectId;
+            if (typeof objectId !== "string" || !objectId) throw new Error("Chrome did not return a file input objectId");
+            try {
+              await cdp(this.bridge, tabId, label, "DOM.setFileInputFiles", { files: realPaths, objectId }, true);
+            } catch (error) {
+              if (/not allowed/i.test((error as Error).message)) {
+                throw new Error(`${(error as Error).message}. Enable "Allow access to file URLs" for Universal Browser Bridge in chrome://extensions`);
+              }
+              throw error;
+            }
+            return { uploaded: realPaths.length, files: realPaths, method: "input", picker: "input" };
+          }
         }
-        return { uploaded: realPaths.length, files: realPaths };
+        await this.approveClickIfNeeded(clientId, tabId, message);
+        const target = (await evaluate(this.bridge, tabId, label, clickTargetScript(message.ref ?? ""), { requiresWritable: true })) as ClickTarget;
+        await this.assertWritableTab(tabId, label);
+        this.assertGenerationCurrent(tabId, message.snapshotId);
+        return this.bridge.command({ action: "uploadViaFileChooser", tabId, label, files: realPaths, timeoutMs: 5000,
+          ...(target.hasSize && target.visible && target.hitTarget ? { x: target.x, y: target.y } : { ref: message.ref }) });
       });
     }
 

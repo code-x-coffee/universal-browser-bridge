@@ -79,6 +79,37 @@ it("sends upload folders in hello and sitePolicy and resends storage changes", a
   expect(FakeSocket.instance.messages.filter((message) => message.type === "sitePolicy").at(-1).uploadFolders).toEqual([]);
 });
 
+it("sends download folders in hello and sitePolicy and resends changes separately from uploads", async () => {
+  expect(FakeSocket.instance.messages.find((message) => message.type === "hello").downloadFolders)
+    .toEqual(["/Volumes/NVme/Projects/Stories/"]);
+  await mock.chrome.storage.local.set({ downloadFolders: [" /tmp/media ", "relative", "/tmp/media/"] });
+  await settle();
+  expect(FakeSocket.instance.messages.filter((message) => message.type === "sitePolicy").at(-1))
+    .toMatchObject({ downloadFolders: ["/tmp/media/"], uploadFolders: ["/Volumes/NVme/Projects/Stories/"] });
+  await mock.chrome.storage.local.set({ downloadFolders: [] });
+  await settle();
+  expect(FakeSocket.instance.messages.filter((message) => message.type === "sitePolicy").at(-1).downloadFolders).toEqual([]);
+});
+
+it("independently guards folder-scoped download CDP calls for ownership, folders and read-only tabs", async () => {
+  const owned = await create("Hephaestus");
+  const shared = await create();
+  const send = vi.spyOn(mock.chrome.debugger, "sendCommand");
+  const download = { action: "cdp", label: "Hephaestus", method: "Runtime.evaluate", params: { expression: "void 0" }, downloadFolder: "/Volumes/NVme/Projects/Stories/" };
+  expect((await command({ ...download, tabId: shared.id })).error).toMatch(/owned.*label/i);
+  mock.tabsById.get(owned.id)!.pendingUrl = "https://hdfcbank.com/";
+  expect((await command({ ...download, tabId: owned.id, requiresWritable: false })).error).toContain("read-only");
+  delete mock.tabsById.get(owned.id)!.pendingUrl;
+  await mock.chrome.storage.local.set({ downloadFolders: [] });
+  expect((await command({ ...download, tabId: owned.id })).error).toMatch(/downloads are disabled/i);
+  await mock.chrome.storage.local.set({ downloadFolders: ["/other/"] });
+  expect((await command({ ...download, tabId: owned.id })).error).toMatch(/allowed.*folder/i);
+  expect(send).not.toHaveBeenCalled();
+  await mock.chrome.storage.local.set({ downloadFolders: ["/Volumes/NVme/Projects/Stories/"] });
+  expect((await command({ ...download, tabId: owned.id })).error).toBeUndefined();
+  expect(send).toHaveBeenCalledOnce();
+});
+
 it("allows file attachment only to tabs owned by the supplied label", async () => {
   const owned = await create("Hephaestus");
   const shared = await create();

@@ -203,7 +203,9 @@ ubb --label Hephaestus browser_close_tab '{"tabId":123}'
 
 `browser_list_agent_tabs` returns `{tabId, url, title, groupId}` for each tab owned by the caller's label. `browser_status` and `browser_tabs` include hand-shared tabs and the caller's owned tabs. Every browser tool accepts owned tab IDs. Other labels, including clients without a label, cannot list, read, drive or close those tabs. A label is a caller-supplied identity: authenticated clients presenting the same label share ownership, even across separate CLI invocations or MCP sessions.
 
-Ownership is stored in [`chrome.storage.session`](https://developer.chrome.com/docs/extensions/reference/api/storage#property-session). It survives extension service-worker restarts and daemon/client reconnects within the Chrome session. Restarting Chrome, reloading/updating the extension, or disabling it clears session storage. Restoration reconciles closed tabs and tabs that have left their original group. Closing, ungrouping, moving a tab to another group, renaming its group, clicking the toolbar to unshare, or cancelling debugging revokes ownership. Merely placing an existing tab in a named group never grants an agent access to it.
+Current tab access is stored in `chrome.storage.session`; labelled ownership is also stored in `chrome.storage.local` under `agentTabOwnersDurable`. It survives service-worker restarts, extension reloads/updates, and daemon/client reconnects when the recorded tab, exact label/group title and agent window still validate. The group title is the literal label, including spaces and pattern characters; unlabelled tabs use **Agent Bridge**. Restoration never derives a label from a group or adopts other tabs in that group. Missing tabs, invalid mappings, duplicate records and ambiguous windows are dropped. The agent window is restored only from validated owned tabs. Hand-shared and unlabelled access remains session-only.
+
+Closing, ungrouping, moving a tab to another group/window, renaming its group, clicking the toolbar to unshare, or cancelling debugging revokes ownership and removes its durable record. Durable revocation also prevents stale session data from restoring access. Merely placing an existing tab in a named group never grants an agent access to it.
 
 Without a label, `browser_new_tab` keeps the existing behavior: it creates a shared, unowned tab in **Agent Bridge**. All clients may read and drive it. While its creating client remains connected, only that client may close it; after disconnect it may be closed by another client. `browser_list_agent_tabs` requires a label. `browser_close_tab` also accepts hand-shared tabs legitimately controlled by the caller. Hand sharing still uses **Agent Bridge** and the **ON** badge.
 
@@ -225,7 +227,11 @@ Blocked pages are hidden from tab listings and refuse new tabs, navigation to th
 
 ### Uploading files
 
-Use `browser_upload_file` to attach local files to an `<input type="file">`, a label associated with one, or a button/container with exactly one file input. Pass `ref`, `description`, `snapshotId` and `files` (an array of absolute file paths). `tabId` is optional and otherwise uses the selected tab. Take a fresh `browser_snapshot` after navigation.
+Use `browser_upload_file` to attach local files through an existing file input or an upload button that opens a file chooser. Pass `ref`, `description`, `snapshotId` and `files` (an array of absolute file paths). `tabId` is optional and otherwise uses the selected tab. Take a fresh `browser_snapshot` after navigation. Optional `mode` controls how the files are attached:
+
+- `auto` (default): use an `<input type="file">`, an associated label, or a container with exactly one file input when available; otherwise click the ref and intercept the chooser.
+- `input`: require a resolvable file input and retain the "Target is not a file input" error for other elements.
+- `chooser`: always click the ref and intercept the chooser, including dynamically created inputs.
 
 ```json
 {
@@ -233,6 +239,7 @@ Use `browser_upload_file` to attach local files to an `<input type="file">`, a l
   "description": "Attach the reference image",
   "snapshotId": "7:0",
   "files": ["/Volumes/NVme/Projects/Stories/reference.png"],
+  "mode": "auto",
   "tabId": 7
 }
 ```
@@ -241,9 +248,38 @@ In Extension options, set **Allowed upload folders**, one absolute folder per li
 
 Uploads require a labelled agent and a tab owned by that same label. Hand-shared tabs, blocklisted sites, and bank/card/payment/password-manager pages cannot receive files. Disabled file inputs are rejected; attaching multiple files requires the input's `multiple` attribute. Each call accepts 1–10 regular files, each at most 100 MB (104,857,600 bytes).
 
-The daemon resolves files and allowed folders with `realpath` and checks containment, so sibling prefixes and symlinks escaping an allowed folder are rejected. Symlinks pointing into an allowed folder resolve to the real file path, which is passed to Chrome and returned as `{ "uploaded": 1, "files": ["/absolute/real/path"] }`. The extension independently checks these real paths against its configured folder prefixes; when configuring a symlinked folder, also allow its real destination. Paths containing NUL or `..` segments are refused.
+The daemon resolves files and allowed folders with `realpath` and checks containment, so sibling prefixes and symlinks escaping an allowed folder are rejected. Symlinks pointing into an allowed folder resolve to the real file path, which is passed to Chrome and returned as `{ "uploaded": 1, "files": ["/absolute/real/path"], "method": "input", "picker": "input" }`. `method` is `input` or `chooser`; `picker` is `input` or `showOpenFilePicker`. The extension independently checks these real paths against its configured folder prefixes; when configuring a symlinked folder, also allow its real destination. Paths containing NUL or `..` segments are refused.
+
+Chooser mode uses the same scroll-to-center, hit-test and trusted mouse input as `browser_click`, with a user-activated script fallback for covered, zero-size or offscreen targets. Consequential clicks retain approval. The extension handles interception and attachment in one command, listens only for the target tab's chooser, and rejects multiple files if it opens in single-selection mode. If no chooser opens within 5 seconds, the error reports whether the `showOpenFilePicker` shim was triggered, with a file-scheme permission hint when that permission is off.
+
+During a chooser call, `window.showOpenFilePicker` is temporarily replaced with a hidden file input that respects `multiple` and the file types in `accept`. Its promise resolves after the input's change event to file-handle-like objects with `kind`, `name`, `getFile`, permission methods and `isSameEntry`. These are not native `FileSystemFileHandle` instances; pages checking `instanceof FileSystemFileHandle` may fail. The extension always attempts to disable interception and restore the original picker after success, timeout or error. A 10-second page timer also restores the shim if normal cleanup cannot run.
 
 Open `chrome://extensions`, find **Universal Browser Bridge**, open **Details**, and enable **Allow access to file URLs**. Reload the updated extension and rebuild/restart the daemon and MCP adapters before using the new tool. Live Chrome uploads are a separate manual check from automated tests.
+
+### Downloading files
+
+Use `browser_download` to save media from a tab owned by your agent label directly to an allowed local folder. It fetches inside the page and transfers bytes to the daemon, so Chrome's Save As preference and the background agent window do not affect saving. Pass `filename`, `description`, and either `ref` + `snapshotId` from `browser_snapshot` or `url`. Snapshots include visible video, image and audio elements within the existing 250-element cap. Ref sources can be `<video>`, `<audio>`, `<source>`, `<img>` or `<a>`; the tool uses `currentSrc`, `src` or `href`.
+
+```json
+{
+  "ref": "ubb-3",
+  "snapshotId": "7:0",
+  "filename": "scene.mp4",
+  "description": "Save the generated scene",
+  "subfolder": "renders",
+  "tabId": 7
+}
+```
+
+For a URL source, replace `ref` and `snapshotId` with `url`. HTTP(S) URLs must have the same origin as the tab. Blob URLs must belong to that origin; data URLs are also allowed. Other schemes, cross-origin sources and redirects are refused. Downloads require a labelled agent, a tab owned by that label, and a writable, unblocked site. Hand-shared tabs cannot download files. Ref downloads require a current snapshot after navigation. The tool reads media without clicking the page.
+
+In Extension options, edit **Allowed download folders** and click **Save safety settings**. This list is separate from upload folders and defaults to `/Volumes/NVme/Projects/Stories/` only when the setting is unset. An empty list disables downloads; an older extension that does not send the policy also leaves downloads disabled. `folder` optionally selects a configured folder; the default is the first. `subfolder` is relative to it. Neither agents nor tools can edit the allowed list.
+
+Each download is limited to 500 MB (524,288,000 bytes), checked against Content-Length when present and the fetched Blob size before transfer. The daemon transfers 1 MB chunks into a private `.<name>.<id>.ubb-partial` file. It atomically publishes the completed file without overwriting existing files or following final-path symlinks. Collisions become `scene (1).mp4`, `scene (2).mp4`, and so on. The result is `{ "saved": "/real/path/renders/scene.mp4", "bytes": 12345, "mimeType": "video/mp4" }`.
+
+Filenames use only the basename, remove control characters, separators, colons and leading dots, and are trimmed to 200 characters while preserving the extension. Empty names are rejected. Subfolders cannot be absolute or contain `..` segments; each segment is sanitized, created and resolved within the real allowed folder. Symlink escapes are refused before creating further directories outside that folder.
+
+Errors remove the temporary file and attempt to release the page-held Blob. A two-minute page timer also releases abandoned fetches and Blobs when a disconnect, navigation or policy change prevents normal cleanup. Active chunk transfers refresh that timer. Download operations recheck site access and the selected folder before each page command.
 
 ## Annotations
 
@@ -336,14 +372,15 @@ Both commands use the authenticated daemon control socket, so **serve** must be 
 | --- | --- |
 | `browser_status` | Show extension connection state, shared tabs and caller-owned tabs |
 | `browser_tabs` | List shared tabs and caller-owned tabs |
-| `browser_new_tab` | Open a tab in the agent window, owned and grouped under the caller's label when supplied |
-| `browser_list_agent_tabs` | List the caller label's tabs as tabId, url, title and groupId |
+| `browser_new_tab` | Open a tab in the agent window; labelled ownership survives reloads when its exact group and window still validate |
+| `browser_list_agent_tabs` | List the caller label's current or validated restored tabs as tabId, url, title and groupId |
 | `browser_close_tab` | Close a caller-owned tab or a tab otherwise legitimately shared with the caller |
 | `browser_snapshot` | Read compact interactive elements and receive a `snapshotId` |
 | `browser_navigate` | Navigate a shared tab to an allowed URL |
 | `browser_click` | Scroll to and click a snapshot element with trusted mouse input (script fallback); consequential approval applies unless the caller's owned tab is trusted |
 | `browser_type` | Replace the contents of a snapshot input element with user activation |
-| `browser_upload_file` | Attach up to 10 allowed local files to a file input in a tab owned by the caller's label |
+| `browser_upload_file` | Attach up to 10 allowed local files through an input or intercepted chooser in a caller-owned tab; modes: auto, input, chooser |
+| `browser_download` | Save same-origin, blob or data media from a caller-owned tab to an allowed download folder, up to 500 MB |
 | `browser_press` | Send trusted keyboard input; Enter and NumpadEnter require approval unless the caller's owned tab is trusted |
 | `browser_scroll` | Scroll a shared page by pixels |
 | `browser_screenshot` | Capture a PNG screenshot of a shared tab |
@@ -496,6 +533,22 @@ curl http://127.0.0.1:17321/health
 
 A successful pairing reports `"connected": true`.
 
+The extension sends its existing 20-second ping while connected. A `ubb-keepalive` Chrome alarm runs every 30 seconds and reconnects when the socket is closed or unauthenticated, including after the service worker has stopped during a longer daemon outage. This version adds the **alarms** permission; reload the extension to apply the manifest change.
+
+### Daemon logs and detach diagnostics
+
+`serve` writes logs to stderr, shown in its terminal or captured by your process supervisor. There is no built-in log file. To capture one yourself:
+
+```bash
+npm run serve 2>>/tmp/ubb-daemon.log
+```
+
+Every daemon log line, including startup, shutdown, webhook errors and diagnostics, has a local ISO timestamp with its UTC offset, for example `[2026-10-20T12:34:56.123+05:30]`. MCP stdout and CLI JSON output retain their existing format.
+
+The log records extension connection/disconnection, restored tab ownership, and structured extension diagnostics with `event`, `tabId`, `reason`, optional `label`, and the event's `at` timestamp. Detach diagnostics use `event: "debuggerDetached"` and preserve Chrome's reason. Up to 50 diagnostics are queued in the worker while disconnected and flushed on reconnection.
+
+`canceled_by_user` immediately revokes access, removes durable ownership and cancels recovery. For other reasons such as `target_closed`, a labelled tab that still exists in its exact owner group and window gets one re-attach attempt after about 500 ms. Attempts are limited to three per tab per minute. Commands are refused while recovery is pending. Failed validation, attachment failure or the rate limit drops ownership and is logged; a real closed tab cannot be recovered. Successful recovery logs `debuggerReattached`. Hand-shared tabs retain the existing revocation behavior.
+
 ### Toolbar badge meanings
 
 | Badge | Meaning |
@@ -533,10 +586,11 @@ npm run serve
 
 ### Shared tab disappears
 
-- Confirm the tab remains in the **Agent Bridge** group.
+- Confirm the tab remains in its exact label group, or **Agent Bridge** for a hand-shared tab.
 - Renaming the group or dragging the tab out revokes access by design.
 - Clicking the extension icon toggles sharing.
 - Chrome may refuse debugger attachment while DevTools is attached to the same target.
+- Inspect the daemon's `debuggerDetached`, `ownershipDropped` and `debuggerReattachFailed` diagnostics for the reason.
 
 ### New unpacked folder lost its settings
 
@@ -546,6 +600,7 @@ Chrome assigns unpacked extensions an identity based partly on their loaded dire
 
 - TypeScript/daemon change: run `npm run build`, then restart `serve` and MCP adapters.
 - Extension JavaScript change: click **Reload** in `chrome://extensions`.
+- Manifest change, including the new **alarms** permission: reload the extension. Labelled tabs restore only after their stored group and window pass validation.
 - MCP client configuration change: restart the MCP client or start a new agent session.
 
 ## Security boundaries
@@ -556,6 +611,8 @@ Chrome assigns unpacked extensions an identity based partly on their loaded dire
 - Only explicitly shared tabs are attached through `chrome.debugger`.
 - Password input values are omitted from snapshots.
 - File uploads require live ownership by the caller's label, writable/unblocked sites, and user-configured allowed folders; the daemon validates real paths, file types and sizes, and the extension independently guards attachment.
+- Downloads require a caller-owned, writable, unblocked tab and a separately configured allowed download folder. The daemon checks source origins, a 500 MB cap and real destination paths; the extension independently checks ownership, site access and the selected folder. Chunk transfers use private temporary files and atomic publication without overwrite. MCP tools cannot change download permissions.
+- Chooser uploads retain those checks and consequential-click approval. The extension rechecks access before each operation, limits interception to one upload per tab, and restores the picker shim and interception after the call. If access is revoked mid-call, cleanup still attempts to disable interception and restore the shim.
 - Navigation and new tabs accept only allowed `http:` and `https:` URLs.
 - Localhost and private-network destinations are blocked unless explicitly enabled.
 - Consequential clicks and Enter presses require Chrome-hosted human approval unless the extension's trust setting is enabled and the live tab belongs to the caller's label.
@@ -565,6 +622,7 @@ Chrome assigns unpacked extensions an identity based partly on their loaded dire
 - Blocklisted domains and their subdomains refuse all page operations in owned and hand-shared tabs, with current and pending URL checks in both the daemon and extension.
 - The model cannot approve its own request.
 - Agent-created tabs belong to their creating adapter while it is connected.
+- Durable labelled ownership requires a stored record and an exact label/group/window match. Group titles alone never grant ownership. Explicit debugging cancellation and revoked durable records cannot trigger automatic re-attachment or restoration.
 - Per-tab queues prevent concurrent agents from interleaving actions.
 - Snapshot generations prevent old references from acting after navigation.
 - Dragging a tab out of the **Agent Bridge** group revokes access.

@@ -13,10 +13,12 @@ export type SharedTab = {
 };
 
 export type AgentTab = { tabId: number; url: string; title: string; groupId: number };
+export type ExtensionDiagnostic = { type: "diagnostic"; event: string; tabId: number; reason?: string; label?: string; at: string };
 
 export type ExtensionMessage =
-  | { type: "hello"; token: string; version: number; blockedDomains?: string[]; uploadFolders?: string[] }
-  | { type: "sitePolicy"; blockedDomains: string[]; uploadFolders?: string[] }
+  | ExtensionDiagnostic
+  | { type: "hello"; token: string; version: number; blockedDomains?: string[]; uploadFolders?: string[]; downloadFolders?: string[] }
+  | { type: "sitePolicy"; blockedDomains: string[]; uploadFolders?: string[]; downloadFolders?: string[] }
   | { type: "tabs"; tabs: SharedTab[] }
   | { type: "response"; id: string; result?: unknown; error?: string }
   | { type: "event"; tabId: number; method: string; params: unknown }
@@ -32,14 +34,20 @@ export type AnnotationExtensionMessage =
 export type BridgeCommand = {
   type: "command";
   id: string;
-  action: "listTabs" | "listAgentTabs" | "getTab" | "createTab" | "closeTab" | "requestApproval" | "cdp";
+  action: "listTabs" | "listAgentTabs" | "getTab" | "createTab" | "closeTab" | "requestApproval" | "cdp" | "uploadViaFileChooser";
   label?: string;
   tabId?: number;
   method?: string;
   params?: Record<string, unknown>;
   requiresWritable?: boolean;
+  downloadFolder?: string;
   url?: string;
   description?: string;
+  files?: string[];
+  x?: number;
+  y?: number;
+  ref?: string;
+  timeoutMs?: number;
 };
 
 export type BridgeStatus = {
@@ -67,6 +75,7 @@ export type ControlAction =
   | "click"
   | "type"
   | "uploadFile"
+  | "download"
   | "navigate"
   | "press"
   | "scroll"
@@ -90,6 +99,10 @@ export type ControlClientMessage =
       ref?: string;
       text?: string;
       files?: string[];
+      mode?: "auto" | "input" | "chooser";
+      filename?: string;
+      folder?: string;
+      subfolder?: string;
       snapshotId?: string;
       key?: string;
       deltaY?: number;

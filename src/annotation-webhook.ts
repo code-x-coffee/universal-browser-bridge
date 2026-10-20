@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import { annotationDataRoot, type Annotation } from "./annotations.js";
+import { log } from "./log.js";
 
 const httpUrl = z.string().url().refine((url) => /^https?:\/\//i.test(url));
 const configSchema = z.object({
@@ -38,7 +39,7 @@ export class AnnotationWebhook {
     this.env = options.env ?? process.env;
     this.fetch = options.fetch ?? globalThis.fetch;
     this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-    this.logger = options.logger ?? ((message) => process.stderr.write(message + "\n"));
+    this.logger = options.logger ?? log;
     this.timeoutMs = options.timeoutMs ?? 10_000;
     this.backoffMs = options.backoffMs ?? [1_000, 2_000, 4_000];
   }

@@ -1,5 +1,7 @@
 import { isReadOnlyBrowserUrl, normalizeBlockedDomains, isBlockedBrowserUrl, assertTabNotBlocked } from "./url-policy.js";
 import { DEFAULT_UPLOAD_FOLDERS, normalizeUploadFolders } from "./upload-policy.js";
+import { uploadViaFileChooser } from "./file-chooser.js";
+import { DEFAULT_DOWNLOAD_FOLDERS, normalizeDownloadFolders } from "./download-policy.js";
 
 const PROTOCOL_VERSION = 1;
 const DEFAULT_URL = "ws://127.0.0.1:17321/extension";
@@ -18,6 +20,10 @@ const groupingInProgress = new Set();
 const revocationChecks = new Map();
 const pendingAnnotations = new Map();
 const tabGenerations = new Map();
+const pendingDiagnostics = [];
+const reattachJobs = new Map();
+const reattachAttempts = new Map();
+let persistence = Promise.resolve();
 let authenticated = false;
 // Debounce window before acting on a possible group departure. Chrome
 // dispatches tabs.onUpdated/tabGroups.onUpdated over a channel that isn't
@@ -30,6 +36,18 @@ let authenticated = false;
 // re-check, not the timer.
 const REVOCATION_DEBOUNCE_MS = 250;
 
+// Keep this literal rule identical for creation, validation and restoration.
+function agentGroupTitle(label) { return label || AGENT_GROUP_TITLE; }
+
+function diagnostic(event, tabId, reason, label = agentTabOwners.get(tabId)?.label) {
+  const message = { type: "diagnostic", event, tabId, reason, label, at: new Date().toISOString() };
+  if (authenticated && socket?.readyState === WebSocket.OPEN) send(message);
+  else {
+    pendingDiagnostics.push(message);
+    if (pendingDiagnostics.length > 50) pendingDiagnostics.shift();
+  }
+}
+
 async function settings() {
   const saved = await chrome.storage.local.get({ relayUrl: DEFAULT_URL, token: "", trustAgentOwnedTabs: true, autoCreateAgentWindow: true, blockedDomains: [] });
   return { ...saved, blockedDomains: normalizeBlockedDomains(saved.blockedDomains) };
@@ -41,21 +59,28 @@ async function uploadSettings() {
   return { uploadFolders: normalizeUploadFolders(uploadFolders) };
 }
 
+async function downloadSettings() {
+  const { downloadFolders } = await chrome.storage.local.get({ downloadFolders: DEFAULT_DOWNLOAD_FOLDERS });
+  return { downloadFolders: normalizeDownloadFolders(downloadFolders) };
+}
+
 async function connect() {
   authenticated = false;
   clearTimeout(reconnectTimer);
   const { relayUrl, token, blockedDomains } = await settings();
   const { uploadFolders } = await uploadSettings();
+  const { downloadFolders } = await downloadSettings();
   if (!token) {
     setGlobalBadge("?", "#b45309");
     return;
   }
-  socket?.close();
+  const previous = socket;
   const connection = new WebSocket(relayUrl);
   socket = connection;
+  previous?.close();
   connection.addEventListener("open", () => {
     if (socket !== connection) return;
-    connection.send(JSON.stringify({ type: "hello", token, version: PROTOCOL_VERSION, blockedDomains, uploadFolders }));
+    connection.send(JSON.stringify({ type: "hello", token, version: PROTOCOL_VERSION, blockedDomains, uploadFolders, downloadFolders }));
     // Regular WebSocket traffic keeps the MV3 service worker alive (Chrome 116+
     // resets the 30s idle timer on each message).
     clearInterval(keepaliveTimer);
@@ -85,6 +110,7 @@ async function handleMessage(message) {
     authenticated = true;
     setGlobalBadge("", "#0891b2");
     await tabStateReady;
+    for (const message of pendingDiagnostics.splice(0)) send(message);
     await sendSitePolicy();
     await sendTabs();
     for (const tabId of sharedTabs) void refreshAnnotations(tabId).catch(() => {});
@@ -163,8 +189,15 @@ async function handleMessage(message) {
       assertTabNotBlocked(tab, blockedDomains);
       if (message.method === "Page.navigate") assertTabNotBlocked({ url: message.params?.url }, blockedDomains);
       if (message.requiresWritable || message.method?.startsWith("Input.") || message.method === "DOM.setFileInputFiles") assertWritableTab(tab);
+      if (message.downloadFolder !== undefined) await assertDownloadAllowed(message, tab);
       if (message.method === "DOM.setFileInputFiles") await assertFileUploadAllowed(message, tab);
       result = await chrome.debugger.sendCommand({ tabId: message.tabId }, message.method, message.params || {});
+    }
+    if (message.action === "uploadViaFileChooser") {
+      result = await uploadViaFileChooser(message, async () => {
+        const tab = await assertControlledTab(message.tabId, message.label);
+        await assertFileUploadAllowed(message, tab);
+      });
     }
     send({ type: "response", id: message.id, result });
   } catch (error) {
@@ -180,7 +213,8 @@ async function assertUnblockedTab(tab) {
 async function sendSitePolicy() {
   const { blockedDomains } = await settings();
   const { uploadFolders } = await uploadSettings();
-  if (authenticated) send({ type: "sitePolicy", blockedDomains, uploadFolders });
+  const { downloadFolders } = await downloadSettings();
+  if (authenticated) send({ type: "sitePolicy", blockedDomains, uploadFolders, downloadFolders });
 }
 
 async function assertFileUploadAllowed(message, tab) {
@@ -194,7 +228,7 @@ async function assertFileUploadAllowed(message, tab) {
   if (!uploadFolders.length) {
     throw new Error("File uploads are disabled: no allowed upload folders are configured in Extension options");
   }
-  const files = message.params?.files;
+  const files = message.action === "uploadViaFileChooser" ? message.files : message.params?.files;
   if (!Array.isArray(files) || files.length < 1 || files.length > 10) throw new Error("File uploads require 1..10 files");
   for (const file of files) {
     if (typeof file !== "string" || !file.startsWith("/") || file.includes("\0") || file.split("/").includes("..")
@@ -207,6 +241,14 @@ async function assertFileUploadAllowed(message, tab) {
   }
 }
 
+async function assertDownloadAllowed(message, tab) {
+  if (!message.label || agentTabOwners.get(message.tabId)?.label !== message.label) throw new Error("Downloads require a tab owned by your agent label");
+  assertWritableTab(tab);
+  const { downloadFolders } = await downloadSettings();
+  if (!downloadFolders.length) throw new Error("File downloads are disabled: no allowed download folders are configured in Extension options");
+  if (!downloadFolders.includes(message.downloadFolder)) throw new Error("Download folder is not in the allowed download folders");
+}
+
 function assertWritableTab(tab) {
   if (isReadOnlyBrowserUrl(tab.url) || (tab.pendingUrl && isReadOnlyBrowserUrl(tab.pendingUrl))) {
     throw new Error("Bank, card, payment and password-manager pages are read-only");
@@ -217,6 +259,7 @@ async function assertControlledTab(tabId, label) {
   const owner = agentTabOwners.get(tabId);
   if (owner && owner.label !== label) throw new Error(`Tab ${tabId} is owned by agent label "${owner.label}"`);
   if (!sharedTabs.has(tabId)) throw new Error("Tab is not shared or owned by this agent");
+  if (reattachJobs.has(tabId)) throw new Error("Tab debugger is reconnecting; try again shortly");
   if (groupingInProgress.has(tabId)) throw new Error("Tab sharing is still in progress");
   if (!await isInAgentGroup(tabId)) {
     await unshareTab(tabId, { ungroup: false });
@@ -237,9 +280,10 @@ async function shareTab(tabId, label) {
     sharedTabs.add(tabId);
     // Labelled tabs commit their access with finalized ownership below.
     if (!label) await chrome.storage.session.set({ sharedTabIds: [...sharedTabs] });
-    const groupId = await ensureAgentGroup(tabId, label || AGENT_GROUP_TITLE);
+    const groupId = await ensureAgentGroup(tabId, agentGroupTitle(label));
     if (label) {
-      agentTabOwners.set(tabId, { label, groupId });
+      const tab = await chrome.tabs.get(tabId);
+      agentTabOwners.set(tabId, { label, groupId, windowId: tab.windowId });
       await persistAgentTabs();
     }
     await chrome.action.setBadgeText({ tabId, text: "ON" });
@@ -265,6 +309,7 @@ async function shareTab(tabId, label) {
 }
 
 async function unshareTab(tabId, { ungroup = true, notify = true } = {}) {
+  cancelReattach(tabId);
   if (!sharedTabs.has(tabId)) return;
   const inside = ungroup && await isInAgentGroup(tabId);
   sharedTabs.delete(tabId);
@@ -285,7 +330,8 @@ async function restoreSharedTabs(revokedOwnedTabIds = new Set()) {
   for (const tabId of sharedTabIds) {
     try {
       if (revokedOwnedTabIds.has(tabId)) throw new Error("Agent ownership was revoked while the worker was stopped");
-      await chrome.tabs.get(tabId);
+      if (sharedTabs.has(tabId)) continue; // Labelled tabs were already restored and attached.
+      await assertUnblockedTab(await chrome.tabs.get(tabId));
       if (!await isInAgentGroup(tabId)) throw new Error("Tab left the Agent Bridge group");
       await chrome.debugger.attach({ tabId }, "1.3").catch((error) => {
         if (!String(error).includes("already attached")) throw error;
@@ -349,7 +395,8 @@ async function isInAgentGroup(tabId) {
     if (tab.groupId === undefined || tab.groupId < 0) return false;
     const group = await chrome.tabGroups.get(tab.groupId);
     const owner = agentTabOwners.get(tabId);
-    return owner ? tab.groupId === owner.groupId && group.title === owner.label : group.title === AGENT_GROUP_TITLE;
+    return owner ? tab.groupId === owner.groupId && group.title === agentGroupTitle(owner.label)
+      && (owner.windowId === undefined || tab.windowId === owner.windowId) : group.title === AGENT_GROUP_TITLE;
   } catch {
     return false;
   }
@@ -376,21 +423,59 @@ function scheduleRevocationCheck(tabId) {
   revocationChecks.set(tabId, timer);
 }
 
-async function persistAgentTabs() {
+function persistAgentTabs() {
   // Persist access and ownership together so a worker stopping mid-revocation
   // cannot restore an owned tab as an unowned, universally shared tab.
-  await chrome.storage.session.set({ agentTabIds: [...agentTabs], agentTabOwners: [...agentTabOwners], sharedTabIds: [...sharedTabs] });
+  const session = { agentTabIds: [...agentTabs], agentTabOwners: [...agentTabOwners], sharedTabIds: [...sharedTabs] };
+  const durable = [...agentTabOwners].filter(([tabId, owner]) => sharedTabs.has(tabId) && owner.groupId >= 0 && Number.isInteger(owner.windowId))
+    .map(([tabId, owner]) => ({ tabId, label: owner.label, groupTitle: agentGroupTitle(owner.label), windowId: owner.windowId }));
+  // Serialize both stores so an older write cannot resurrect a revoked owner.
+  // Write durable revocation first; a reload clears session storage.
+  const job = persistence.catch(() => {}).then(async () => {
+    await chrome.storage.local.set({ agentTabOwnersDurable: durable });
+    await chrome.storage.session.set(session);
+  });
+  persistence = job;
+  return job;
 }
 
 async function restoreAgentTabs() {
   const revokedOwnedTabIds = new Set();
-  const { agentTabIds = [], agentTabOwners: owners = [] } = await chrome.storage.session.get({ agentTabIds: [], agentTabOwners: [] });
-  for (const [tabId, owner] of owners) {
-    agentTabOwners.set(tabId, owner);
-    if (!await isInAgentGroup(tabId)) {
-      agentTabOwners.delete(tabId);
-      revokedOwnedTabIds.add(tabId);
+  const { agentTabIds = [], agentTabOwners: owners = [], agentWindowId } = await chrome.storage.session.get({ agentTabIds: [], agentTabOwners: [], agentWindowId: undefined });
+  const { agentTabOwnersDurable } = await chrome.storage.local.get("agentTabOwnersDurable");
+  const fromSession = Array.isArray(owners) && owners.length > 0;
+  const records = fromSession ? owners.map(pair => Array.isArray(pair)
+    ? { ...pair[1], tabId: pair[0], groupTitle: agentGroupTitle(pair[1]?.label) } : {})
+    : Array.isArray(agentTabOwnersDurable) ? agentTabOwnersDurable : [];
+  const counts = new Map();
+  for (const record of records) if (record && Number.isInteger(record.tabId)) counts.set(record.tabId, (counts.get(record.tabId) || 0) + 1);
+  const knownWindow = agentWindowId === undefined ? undefined : await chrome.windows.get(agentWindowId).catch(() => undefined);
+  const candidates = [];
+  for (const record of records) {
+    const tabId = record?.tabId;
+    try {
+      if (!Number.isInteger(tabId) || tabId <= 0 || counts.get(tabId) !== 1 || typeof record.label !== "string" || !record.label
+        || record.groupTitle !== agentGroupTitle(record.label)) throw new Error("Invalid or duplicate stored ownership");
+      if (fromSession && agentTabOwnersDurable !== undefined) {
+        const matches = Array.isArray(agentTabOwnersDurable) ? agentTabOwnersDurable.filter(item => item?.tabId === tabId) : [];
+        if (matches.length !== 1 || matches[0].label !== record.label || matches[0].groupTitle !== agentGroupTitle(record.label)
+          || (record.windowId !== undefined && matches[0].windowId !== record.windowId)) throw new Error("Durable ownership was revoked or conflicts with session storage");
+      }
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.groupId < 0 || (fromSession && tab.groupId !== record.groupId)) throw new Error("Tab left its recorded group");
+      const group = await chrome.tabGroups.get(tab.groupId);
+      if (group.title !== agentGroupTitle(record.label)) throw new Error("Group title does not match stored label");
+      if ((record.windowId !== undefined && tab.windowId !== record.windowId) || (knownWindow && tab.windowId !== knownWindow.id)
+        || group.windowId !== tab.windowId) throw new Error("Tab left its agent window");
+      await chrome.windows.get(tab.windowId);
+      candidates.push({ tabId, owner: { label: record.label, groupId: tab.groupId, windowId: tab.windowId } });
+    } catch (error) {
+      if (Number.isInteger(tabId)) { revokedOwnedTabIds.add(tabId); diagnostic("ownershipDropped", tabId, error.message, record?.label); }
     }
+  }
+  // Without a known agent window, conflicting windows have no safe winner.
+  if (!knownWindow && new Set(candidates.map(item => item.owner.windowId)).size > 1) {
+    for (const item of candidates.splice(0)) { revokedOwnedTabIds.add(item.tabId); diagnostic("ownershipDropped", item.tabId, "Ambiguous agent windows", item.owner.label); }
   }
   for (const tabId of agentTabIds) {
     try {
@@ -400,7 +485,99 @@ async function restoreAgentTabs() {
       agentTabs.delete(tabId);
     }
   }
+  for (const { tabId, owner } of candidates) {
+    agentTabOwners.set(tabId, owner);
+    groupingInProgress.add(tabId);
+    try {
+      await assertUnblockedTab(await chrome.tabs.get(tabId));
+      await attachDebugger(tabId);
+      if (agentTabOwners.get(tabId) !== owner || !await isInAgentGroup(tabId)) throw new Error("Ownership changed during restoration");
+      sharedTabs.add(tabId); agentTabs.add(tabId);
+      await chrome.action.setBadgeText({ tabId, text: "ON" });
+      await chrome.action.setBadgeBackgroundColor({ tabId, color: "#0891b2" });
+      diagnostic("ownershipRestored", tabId, fromSession ? "session" : "durable", owner.label);
+    } catch (error) {
+      sharedTabs.delete(tabId); agentTabOwners.delete(tabId); agentTabs.delete(tabId);
+      cancelReattach(tabId); revokedOwnedTabIds.add(tabId);
+      await detachDebugger(tabId);
+      diagnostic("ownershipDropped", tabId, error.message, owner.label);
+    } finally { groupingInProgress.delete(tabId); }
+  }
+  const restored = [...agentTabOwners.values()];
+  if (restored.length) await chrome.storage.session.set({ agentWindowId: restored[0].windowId });
   return revokedOwnedTabIds;
+}
+
+async function attachDebugger(tabId) {
+  await chrome.debugger.attach({ tabId }, "1.3").catch((error) => {
+    if (!/already attached/i.test(String(error))) throw error;
+  });
+}
+
+async function detachDebugger(tabId) {
+  intentionalDetach.add(tabId);
+  try { await chrome.debugger.detach({ tabId }).catch(() => {}); }
+  finally { intentionalDetach.delete(tabId); }
+}
+
+function cancelReattach(tabId) {
+  const job = reattachJobs.get(tabId);
+  if (job) clearTimeout(job.timer);
+  reattachJobs.delete(tabId);
+}
+
+async function dropDetachedTab(tabId, reason) {
+  const owner = agentTabOwners.get(tabId);
+  cancelReattach(tabId);
+  sharedTabs.delete(tabId); agentTabOwners.delete(tabId);
+  if (owner) diagnostic("ownershipDropped", tabId, reason, owner.label);
+  await persistAgentTabs();
+  await detachDebugger(tabId);
+  await chrome.tabs.sendMessage(tabId, { type: "ubbAnnotationsDestroy" }).catch(() => {});
+  await chrome.action.setBadgeText({ tabId, text: "" }).catch(() => {});
+  await sendTabs();
+}
+
+async function recoverDebugger(tabId, owner) {
+  if (reattachJobs.has(tabId)) return;
+  const job = { owner, timer: undefined };
+  reattachJobs.set(tabId, job);
+  const current = () => reattachJobs.get(tabId) === job && agentTabOwners.get(tabId) === owner;
+  const validate = async () => {
+    if (!await isInAgentGroup(tabId)) throw new Error("Tab no longer matches its owner group and window");
+    await assertUnblockedTab(await chrome.tabs.get(tabId));
+  };
+  try {
+    await validate();
+    if (!current()) return;
+    job.timer = setTimeout(async () => {
+      if (!current()) return;
+      try {
+        await validate();
+        if (!current()) return;
+        const attempts = (reattachAttempts.get(tabId) || []).filter(at => Date.now() - at < 60000);
+        if (attempts.length >= 3) throw new Error("Debugger re-attach rate limit: 3 attempts per minute");
+        reattachAttempts.set(tabId, [...attempts, Date.now()]);
+        await attachDebugger(tabId);
+        if (!current()) {
+          // The user can revoke access while Chrome's attach call is in flight.
+          if (!sharedTabs.has(tabId)) await detachDebugger(tabId);
+          return;
+        }
+        await validate();
+        if (!current()) return;
+        reattachJobs.delete(tabId);
+        diagnostic("debuggerReattached", tabId, "Debugger re-attached", owner.label);
+        await sendTabs();
+      } catch (error) {
+        if (!current()) return;
+        diagnostic("debuggerReattachFailed", tabId, error.message, owner.label);
+        await dropDetachedTab(tabId, error.message);
+      }
+    }, 500);
+  } catch (error) {
+    if (current()) await dropDetachedTab(tabId, error.message);
+  }
 }
 
 async function requestApproval(description) {
@@ -589,18 +766,16 @@ chrome.action.onClicked.addListener(async (tab) => {
   }
 });
 
-chrome.debugger.onDetach.addListener(({ tabId }) => {
+chrome.debugger.onDetach.addListener(({ tabId }, reason) => {
+  const owner = agentTabOwners.get(tabId);
+  diagnostic("debuggerDetached", tabId, reason, owner?.label);
   if (intentionalDetach.has(tabId)) return;
-  sharedTabs.delete(tabId);
-  agentTabOwners.delete(tabId);
-  void persistAgentTabs();
-  void chrome.tabs.sendMessage(tabId, { type: "ubbAnnotationsDestroy" }).catch(() => {});
-  chrome.storage.session.set({ sharedTabIds: [...sharedTabs] });
-  chrome.action.setBadgeText({ tabId, text: "" }).catch(() => {});
-  void sendTabs();
+  if (reason !== "canceled_by_user" && owner) void recoverDebugger(tabId, owner);
+  else void dropDetachedTab(tabId, reason);
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  cancelReattach(tabId); reattachAttempts.delete(tabId);
   tabGenerations.delete(tabId);
   sharedTabs.delete(tabId);
   agentTabs.delete(tabId);
@@ -655,8 +830,15 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && (changes.token || changes.relayUrl)) void connect();
-  if (area === "local" && (changes.blockedDomains || changes.uploadFolders)) void sendSitePolicy().then(sendTabs);
+  if (area === "local" && (changes.blockedDomains || changes.uploadFolders || changes.downloadFolders)) void sendSitePolicy().then(sendTabs);
 });
 
 const tabStateReady = restoreAgentTabs().then(restoreSharedTabs);
 void tabStateReady.then(connect);
+
+void chrome.alarms.create("ubb-keepalive", { periodInMinutes: 0.5 });
+chrome.alarms.onAlarm.addListener(({ name }) => {
+  if (name === "ubb-keepalive") void tabStateReady.then(() => {
+    if (!authenticated || socket?.readyState !== WebSocket.OPEN) return connect();
+  }).catch(() => {});
+});
