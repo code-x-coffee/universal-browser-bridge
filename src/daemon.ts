@@ -7,7 +7,8 @@ import { tokensMatch } from "./auth.js";
 import { AnnotationStore } from "./annotations.js";
 import { AnnotationWebhook } from "./annotation-webhook.js";
 import { isPotentiallyConsequential } from "./policy.js";
-import { PROTOCOL_VERSION, type AnnotationExtensionRequest, type ControlClientMessage, type ControlServerMessage, type SharedTab } from "./protocol.js";
+import { PROTOCOL_VERSION, type AnnotationExtensionRequest, type ControlClientMessage, type ControlServerMessage, type SharedTab, type ExtensionDiagnostic } from "./protocol.js";
+import { log } from "./log.js";
 import { clickDetailsScript, clickTargetScript, clickScript, describeKey, scrollScript, snapshotScript, typeScript, uploadFileScript } from "./dom-actions.js";
 import { TabLeaseManager } from "./tab-lease.js";
 import { assertBrowserUrlAllowed, isReadOnlyBrowserUrl, assertTabNotBlocked, isBlockedBrowserUrl } from "./url-policy.js";
@@ -85,8 +86,11 @@ export class DaemonServer {
   ) {
     // Reconcile ownership/lease state for tabs that vanish out-of-band (the
     // user closes them directly in Chrome, or the extension disconnects).
-    this.bridge.on("tabs", (tabs: SharedTab[]) => this.reconcileTabs(tabs));
+    this.bridge.on("tabs", this.handleTabs);
     this.bridge.on("annotations", this.handleAnnotations);
+    this.bridge.on("connected", this.handleConnected);
+    this.bridge.on("disconnected", this.handleDisconnected);
+    this.bridge.on("diagnostic", this.handleDiagnostic);
   }
 
   async start(): Promise<void> {
@@ -97,12 +101,21 @@ export class DaemonServer {
   }
 
   async stop(): Promise<void> {
+    this.bridge.off("tabs", this.handleTabs);
     this.bridge.off("annotations", this.handleAnnotations);
+    this.bridge.off("connected", this.handleConnected);
+    this.bridge.off("disconnected", this.handleDisconnected);
+    this.bridge.off("diagnostic", this.handleDiagnostic);
     for (const client of this.clients.values()) client.socket.destroy();
     this.clients.clear();
     await new Promise<void>((resolve) => (this.server ? this.server.close(() => resolve()) : resolve()));
     if (process.platform !== "win32") await unlink(this.socketPath).catch(() => {});
   }
+
+  private handleTabs = (tabs: SharedTab[]): void => this.reconcileTabs(tabs);
+  private handleConnected = (): void => log("Chrome extension connected");
+  private handleDisconnected = (): void => log("Chrome extension disconnected");
+  private handleDiagnostic = (message: ExtensionDiagnostic): void => log(`Extension diagnostic: ${JSON.stringify(message)}`);
 
   private handleAnnotations = async (message: AnnotationExtensionRequest): Promise<void> => {
     try {
@@ -118,7 +131,7 @@ export class DaemonServer {
         this.bridge.sendAnnotations({ type: "annotationUpdated", annotation });
         // Detach delivery (including synchronous throws) from the committed save.
         void Promise.resolve().then(() => this.webhook.created(annotation)).catch(() => {
-          process.stderr.write("Annotation webhook: delivery error\n");
+          log("Annotation webhook: delivery error");
         });
       }
     } catch (error) {
@@ -170,6 +183,12 @@ export class DaemonServer {
         this.knownTabIds.delete(id);
         this.tabOwners.delete(id);
         this.leases.forgetTab(id);
+      }
+    }
+    for (const tab of tabs) {
+      if (tab.ownerLabel && !this.knownTabIds.has(tab.id)) {
+        this.knownTabIds.add(tab.id);
+        log(`Tab ownership restored: tabId=${tab.id} label=${JSON.stringify(tab.ownerLabel)}`);
       }
     }
   }

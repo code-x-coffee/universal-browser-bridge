@@ -137,6 +137,7 @@ export class BrowserBridge extends EventEmitter {
         this.extension = ws;
         this.allowedUploadFolders = normalizeUploadFolders(message.uploadFolders);
         this.allowedDownloadFolders = normalizeDownloadFolders(message.downloadFolders);
+        this.emit("connected");
         ws.send(JSON.stringify({ type: "ready", version: PROTOCOL_VERSION }));
         ws.send(JSON.stringify({ type: "command", id: randomUUID(), action: "listTabs" }));
         return;
@@ -144,6 +145,15 @@ export class BrowserBridge extends EventEmitter {
 
       // A replaced authenticated peer must not mutate the current session.
       if (this.extension !== ws) return;
+      if (message.type === "diagnostic") {
+        if (typeof message.event !== "string" || !/^[A-Za-z][A-Za-z0-9]{0,79}$/.test(message.event)
+          || !Number.isInteger(message.tabId) || message.tabId < 0 || typeof message.at !== "string" || !Number.isFinite(Date.parse(message.at))
+          || (message.reason !== undefined && typeof message.reason !== "string") || (message.label !== undefined && typeof message.label !== "string")) return;
+        this.emit("diagnostic", { type: "diagnostic", event: message.event, tabId: message.tabId, at: message.at,
+          ...(message.reason === undefined ? {} : { reason: message.reason.slice(0, 500) }),
+          ...(message.label === undefined ? {} : { label: message.label.slice(0, 200) }) });
+        return;
+      }
       if (message.type === "sitePolicy") {
         this.allowedUploadFolders = normalizeUploadFolders(message.uploadFolders);
         this.allowedDownloadFolders = normalizeDownloadFolders(message.downloadFolders);
@@ -183,6 +193,7 @@ export class BrowserBridge extends EventEmitter {
         this.extension = undefined;
         this.allowedUploadFolders = [];
         this.allowedDownloadFolders = [];
+        this.emit("disconnected");
         this.tabs = [];
         this.emit("tabs", this.tabs);
         for (const [id, pending] of this.pending) {

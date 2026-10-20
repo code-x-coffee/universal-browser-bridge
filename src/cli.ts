@@ -10,6 +10,7 @@ import { parseAnnotationArgs } from "./annotation-cli.js";
 import type { WebhookResult } from "./annotation-webhook.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { log } from "./log.js";
 
 const args = process.argv.slice(2);
 let label = process.env.UBB_CLIENT_LABEL;
@@ -19,7 +20,13 @@ if (args[0] === "--label") {
   if (!label?.trim() || label.startsWith("--")) throw new Error("--label requires a non-empty agent name");
 }
 const command = args.shift() ?? "help";
-const token = command === "help" ? "" : await getOrCreateToken();
+let token: string;
+try { token = command === "help" ? "" : await getOrCreateToken(); }
+catch (error) {
+  if (command !== "serve") throw error;
+  log((error as Error).stack ?? String(error));
+  process.exit(1);
+}
 
 if (command === "token") {
   process.stdout.write(`${token}\n`);
@@ -27,11 +34,17 @@ if (command === "token") {
 } else if (command === "serve") {
   const port = process.env.UBB_PORT ? Number(process.env.UBB_PORT) : 17321;
   const bridge = new BrowserBridge(token, "127.0.0.1", port);
-  await bridge.start();
   const socketPath = daemonSocketPath();
   const daemon = new DaemonServer(bridge, token, socketPath);
-  await daemon.start();
-  process.stderr.write(
+  try {
+    await bridge.start();
+    await daemon.start();
+  } catch (error) {
+    log((error as Error).stack ?? String(error));
+    await bridge.stop();
+    process.exit(1);
+  }
+  log(
     `Universal Browser Bridge daemon listening.\n` +
       `  Extension endpoint: 127.0.0.1:${bridge.port}\n` +
       `  Control socket:     ${socketPath}\n` +
@@ -43,10 +56,11 @@ if (command === "token") {
   const shutdown = async (signal: NodeJS.Signals) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    process.stderr.write(`\nReceived ${signal}; shutting down the daemon...\n`);
-    await daemon.stop();
-    await bridge.stop();
-    process.exit(0);
+    log(`Received ${signal}; shutting down the daemon...`);
+    let code = 0;
+    await daemon.stop().catch((error) => { log((error as Error).stack ?? String(error)); code = 1; });
+    await bridge.stop().catch((error) => { log((error as Error).stack ?? String(error)); code = 1; });
+    process.exit(code);
   };
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));

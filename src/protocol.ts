@@ -13,8 +13,10 @@ export type SharedTab = {
 };
 
 export type AgentTab = { tabId: number; url: string; title: string; groupId: number };
+export type ExtensionDiagnostic = { type: "diagnostic"; event: string; tabId: number; reason?: string; label?: string; at: string };
 
 export type ExtensionMessage =
+  | ExtensionDiagnostic
   | { type: "hello"; token: string; version: number; blockedDomains?: string[]; uploadFolders?: string[]; downloadFolders?: string[] }
   | { type: "sitePolicy"; blockedDomains: string[]; uploadFolders?: string[]; downloadFolders?: string[] }
   | { type: "tabs"; tabs: SharedTab[] }

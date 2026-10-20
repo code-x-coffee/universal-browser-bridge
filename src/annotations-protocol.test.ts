@@ -160,5 +160,8 @@ it.each(["throws", "rejects", "hangs"])("still saves and responds when the detac
   expect(created).toHaveBeenCalledOnce();
   expect((await request(control(), { action: "annotationsGet", annotationId: saved.result.id })).result).toEqual(saved.result);
   expect(extension.messages).toContainEqual({ type: "annotationUpdated", annotation: saved.result });
-  if (behavior !== "hangs") expect(stderr).toHaveBeenCalledWith("Annotation webhook: delivery error\n");
+  if (behavior !== "hangs") expect(stderr).toHaveBeenCalledWith(expect.stringMatching(
+    /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}\] Annotation webhook: delivery error\n$/
+  ));
+  expect(stderr.mock.calls.map((args) => String(args[0])).join("")).not.toContain("secret failure");
 });

@@ -37,7 +37,7 @@ export async function runMcpServer(bridge: DaemonClient, transport: Transport = 
     text(await bridge.request({ action: "listTabs" }))
   );
 
-  server.tool("browser_list_agent_tabs", "List tabs owned by your agent label, including tabId, url, title and groupId. Requires a label.", {}, async () =>
+  server.tool("browser_list_agent_tabs", "List tabs owned by your agent label, including tabId, url, title and groupId. Requires a label. Recorded ownership can survive extension reloads after exact label/group-title and agent-window validation; other tabs in the group are never adopted.", {}, async () =>
     text(await bridge.request({ action: "listAgentTabs" }))
   );
 
@@ -68,7 +68,7 @@ export async function runMcpServer(bridge: DaemonClient, transport: Transport = 
   );
   server.tool(
     "browser_new_tab",
-    "Open a tab in the dedicated agent window. With a label, group and own the tab under that label across client invocations. Without a label, create an unowned shared tab. The window is created without a prompt by default. Chrome asks first only if the user turned off \"Let agents open their window without asking\".",
+    "Open a tab in the dedicated agent window. With a label, use that literal label as the group title and durably own the tab across client invocations and extension reloads, subject to stored group/window validation. Without a label, create an unowned shared tab. Explicit debugging cancellation revokes ownership. The window is created without a prompt by default. Chrome asks first only if the user turned off \"Let agents open their window without asking\".",
     { url: httpUrl },
     async ({ url }) => text(await bridge.request({ action: "createTab", url }))
   );
