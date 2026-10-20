@@ -1,4 +1,5 @@
 import { unlink } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import type { BrowserBridge } from "./bridge.js";
@@ -11,6 +12,9 @@ import { clickDetailsScript, clickTargetScript, clickScript, describeKey, scroll
 import { TabLeaseManager } from "./tab-lease.js";
 import { assertBrowserUrlAllowed, isReadOnlyBrowserUrl, assertTabNotBlocked, isBlockedBrowserUrl } from "./url-policy.js";
 import { validateUploadFiles } from "./upload-policy.js";
+import { assertDownloadSource, prepareDownloadDestination, saveDownload } from "./download-policy.js";
+import { assertDownloadUrl } from "../extension/download-policy.js";
+import { downloadSourceScript, downloadFetchScript, downloadChunkScript, downloadCleanupScript } from "./download-scripts.js";
 
 type ControlRequest = Extract<ControlClientMessage, { type: "request" }>;
 
@@ -31,11 +35,13 @@ async function getUnblockedTab(bridge: BrowserBridge, tabId: number, label: stri
   return tab;
 }
 
-async function cdp(bridge: BrowserBridge, tabId: number, label: string | undefined, method: string, params: Record<string, unknown> = {}, requiresWritable = false): Promise<any> {
+async function cdp(bridge: BrowserBridge, tabId: number, label: string | undefined, method: string, params: Record<string, unknown> = {}, requiresWritable = false, options: { downloadFolder?: string; timeoutMs?: number } = {}): Promise<any> {
   if (method === "Page.navigate") assertTabNotBlocked({ url: params.url as string }, bridge.blockedDomains);
   const tab = await getUnblockedTab(bridge, tabId, label);
   if (requiresWritable) assertTabWritable(tab);
-  return bridge.command({ action: "cdp", tabId, label, method, params, requiresWritable });
+  if (options.downloadFolder !== undefined && !bridge.downloadFolders.includes(options.downloadFolder)) throw new Error("Download folder is no longer in the allowed download folders");
+  return bridge.command({ action: "cdp", tabId, label, method, params, requiresWritable,
+    ...(options.downloadFolder === undefined ? {} : { downloadFolder: options.downloadFolder }) }, options.timeoutMs);
 }
 
 function assertTabWritable(tab: { url: string; pendingUrl?: string }): void {
@@ -46,10 +52,10 @@ function assertTabWritable(tab: { url: string; pendingUrl?: string }): void {
 
 // Runtime.evaluate reports page-script throws via exceptionDetails instead of
 // failing the CDP call outright, so surface those as real errors.
-async function evaluate(bridge: BrowserBridge, tabId: number, label: string | undefined, expression: string, options: { requiresWritable?: boolean; userGesture?: boolean } = {}): Promise<unknown> {
+async function evaluate(bridge: BrowserBridge, tabId: number, label: string | undefined, expression: string, options: { requiresWritable?: boolean; userGesture?: boolean; downloadFolder?: string; timeoutMs?: number } = {}): Promise<unknown> {
   const result = await cdp(bridge, tabId, label, "Runtime.evaluate", {
     expression, returnByValue: true, awaitPromise: true, userGesture: options.userGesture
-  }, options.requiresWritable);
+  }, options.requiresWritable, options);
   if (result?.exceptionDetails) {
     throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text ?? "Page script failed");
   }
@@ -387,6 +393,39 @@ export class DaemonServer {
         await this.assertWritableTab(tabId, label);
         this.assertGenerationCurrent(tabId, message.snapshotId);
         return evaluate(this.bridge, tabId, label, typeScript(message.ref ?? "", message.text ?? ""), { requiresWritable: true, userGesture: true });
+      });
+    }
+
+    if (action === "download") {
+      return this.leases.runExclusive(tabId, async () => {
+        assertDownloadSource(message);
+        if (typeof message.description !== "string" || !message.description.trim()) throw new Error("A description is required for downloads");
+        if (typeof label !== "string" || !label.trim()) throw new Error("An agent label is required for downloads");
+        const ownedTabs = await this.bridge.command({ action: "listAgentTabs", label });
+        if (!Array.isArray(ownedTabs) || !ownedTabs.some((tab) => tab.tabId === tabId)) throw new Error("Downloads require a tab owned by your agent label; hand-shared tabs cannot download files");
+        const tab = await getUnblockedTab(this.bridge, tabId, label);
+        assertTabWritable(tab);
+        if (message.ref !== undefined) this.assertGenerationCurrent(tabId, message.snapshotId);
+        if (message.url !== undefined) assertDownloadUrl(message.url, tab.url);
+        const destination = await prepareDownloadDestination(message, this.bridge.downloadFolders);
+        const options = { requiresWritable: true, downloadFolder: destination.folder };
+        const source = await evaluate(this.bridge, tabId, label, downloadSourceScript({ ref: message.ref, url: message.url }), options);
+        const live = await getUnblockedTab(this.bridge, tabId, label);
+        const url = assertDownloadUrl(source, live.url);
+        const key = randomUUID();
+        try {
+          const metadata = (await evaluate(this.bridge, tabId, label, downloadFetchScript(key, url), {
+            ...options, userGesture: true, timeoutMs: 125_000
+          })) as { size: number; mimeType: string };
+          if (!metadata || typeof metadata.mimeType !== "string") throw new Error("Chrome did not return download metadata");
+          const saved = await saveDownload(destination, metadata.size, (offset, length) =>
+            evaluate(this.bridge, tabId, label, downloadChunkScript(key, offset, length), options));
+          return { saved, bytes: metadata.size, mimeType: metadata.mimeType };
+        } finally {
+          // A page timer also expires entries if the connection or tab policy
+          // prevents this cleanup command from reaching the original document.
+          await evaluate(this.bridge, tabId, label, downloadCleanupScript(key), options).catch(() => {});
+        }
       });
     }
 

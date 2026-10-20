@@ -6,6 +6,7 @@ import { PROTOCOL_VERSION, type AnnotationExtensionMessage, type BridgeCommand, 
 import { tokensMatch } from "./auth.js";
 import { normalizeBlockedDomains } from "./url-policy.js";
 import { normalizeUploadFolders } from "./upload-policy.js";
+import { normalizeDownloadFolders } from "../extension/download-policy.js";
 
 type Pending = { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout };
 
@@ -20,6 +21,7 @@ export class BrowserBridge extends EventEmitter {
   private boundPort = 0;
   private siteBlocklist: string[] = [];
   private allowedUploadFolders: string[] = [];
+  private allowedDownloadFolders: string[] = [];
 
   constructor(
     private readonly token: string,
@@ -39,6 +41,10 @@ export class BrowserBridge extends EventEmitter {
 
   get uploadFolders(): readonly string[] {
     return this.allowedUploadFolders;
+  }
+
+  get downloadFolders(): readonly string[] {
+    return this.allowedDownloadFolders;
   }
 
   async start(): Promise<void> {
@@ -80,14 +86,14 @@ export class BrowserBridge extends EventEmitter {
     if (this.extension?.readyState === WebSocket.OPEN) this.extension.send(JSON.stringify(message));
   }
 
-  async command(command: Omit<BridgeCommand, "type" | "id">): Promise<unknown> {
+  async command(command: Omit<BridgeCommand, "type" | "id">, timeoutOverrideMs?: number): Promise<unknown> {
     if (!this.extension || this.extension.readyState !== WebSocket.OPEN) {
       throw new Error("Chrome extension is not connected");
     }
     const id = randomUUID();
     const payload: BridgeCommand = { type: "command", id, ...command };
     return new Promise((resolve, reject) => {
-      const timeoutMs = command.action === "requestApproval" || command.action === "createTab" ? 130_000 : 20_000;
+      const timeoutMs = timeoutOverrideMs ?? (command.action === "requestApproval" || command.action === "createTab" ? 130_000 : 20_000);
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`Browser command timed out: ${command.action}`));
@@ -130,6 +136,7 @@ export class BrowserBridge extends EventEmitter {
         this.extension?.close(4409, "Replaced by a newer extension connection");
         this.extension = ws;
         this.allowedUploadFolders = normalizeUploadFolders(message.uploadFolders);
+        this.allowedDownloadFolders = normalizeDownloadFolders(message.downloadFolders);
         ws.send(JSON.stringify({ type: "ready", version: PROTOCOL_VERSION }));
         ws.send(JSON.stringify({ type: "command", id: randomUUID(), action: "listTabs" }));
         return;
@@ -139,6 +146,7 @@ export class BrowserBridge extends EventEmitter {
       if (this.extension !== ws) return;
       if (message.type === "sitePolicy") {
         this.allowedUploadFolders = normalizeUploadFolders(message.uploadFolders);
+        this.allowedDownloadFolders = normalizeDownloadFolders(message.downloadFolders);
         try {
           this.siteBlocklist = normalizeBlockedDomains(message.blockedDomains);
         } catch {
@@ -174,6 +182,7 @@ export class BrowserBridge extends EventEmitter {
       if (this.extension === ws) {
         this.extension = undefined;
         this.allowedUploadFolders = [];
+        this.allowedDownloadFolders = [];
         this.tabs = [];
         this.emit("tabs", this.tabs);
         for (const [id, pending] of this.pending) {

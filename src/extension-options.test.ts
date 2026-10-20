@@ -100,3 +100,23 @@ it("does not save upload folders when a blocklist entry is invalid", async () =>
   expect(await mock.chrome.storage.local.get("uploadFolders")).toEqual({ uploadFolders: ["/saved/"] });
   expect(field("policyStatus").textContent).toMatch(/invalid.*domain/i);
 });
+
+it("shows default download folders independently of upload settings", async () => {
+  await load({ uploadFolders: [] });
+  expect(field("downloadFolders")?.value).toBe("/Volumes/NVme/Projects/Stories/");
+});
+it("loads and preserves an explicitly empty download folder list", async () => {
+  await load({ downloadFolders: [] });
+  expect(field("downloadFolders")?.value).toBe("");
+});
+it("saves normalized download folders separately and reports ignored entries", async () => {
+  await load({ uploadFolders: ["/uploads/"] });
+  field("downloadFolders").value = " /tmp/media \r\nrelative\n/tmp/media/\n/tmp/a/../b\n/tmp/other/";
+  await field("savePolicy").events.get("click")!();
+  expect(await mock.chrome.storage.local.get(["uploadFolders", "downloadFolders"]))
+    .toEqual({ uploadFolders: ["/uploads/"], downloadFolders: ["/tmp/media/", "/tmp/other/"] });
+  expect(field("policyStatus").textContent).toMatch(/ignored 2 invalid download folder/i);
+  field("downloadFolders").value = "\n ";
+  await field("savePolicy").events.get("click")!();
+  expect(await mock.chrome.storage.local.get("downloadFolders")).toEqual({ downloadFolders: [] });
+});

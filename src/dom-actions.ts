@@ -10,7 +10,7 @@ export const snapshotScript = String.raw`
     const rect = el.getBoundingClientRect();
     return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
   };
-  const nodes = [...document.querySelectorAll('a,button,input,label,textarea,select,[role],[contenteditable="true"]')]
+  const nodes = [...document.querySelectorAll('a,button,input,label,textarea,select,video,img,audio,[role],[contenteditable="true"]')]
     .filter(visible)
     .slice(0, 250)
     .map((el, index) => {

@@ -15,8 +15,8 @@ export type SharedTab = {
 export type AgentTab = { tabId: number; url: string; title: string; groupId: number };
 
 export type ExtensionMessage =
-  | { type: "hello"; token: string; version: number; blockedDomains?: string[]; uploadFolders?: string[] }
-  | { type: "sitePolicy"; blockedDomains: string[]; uploadFolders?: string[] }
+  | { type: "hello"; token: string; version: number; blockedDomains?: string[]; uploadFolders?: string[]; downloadFolders?: string[] }
+  | { type: "sitePolicy"; blockedDomains: string[]; uploadFolders?: string[]; downloadFolders?: string[] }
   | { type: "tabs"; tabs: SharedTab[] }
   | { type: "response"; id: string; result?: unknown; error?: string }
   | { type: "event"; tabId: number; method: string; params: unknown }
@@ -38,6 +38,7 @@ export type BridgeCommand = {
   method?: string;
   params?: Record<string, unknown>;
   requiresWritable?: boolean;
+  downloadFolder?: string;
   url?: string;
   description?: string;
   files?: string[];
@@ -72,6 +73,7 @@ export type ControlAction =
   | "click"
   | "type"
   | "uploadFile"
+  | "download"
   | "navigate"
   | "press"
   | "scroll"
@@ -96,6 +98,9 @@ export type ControlClientMessage =
       text?: string;
       files?: string[];
       mode?: "auto" | "input" | "chooser";
+      filename?: string;
+      folder?: string;
+      subfolder?: string;
       snapshotId?: string;
       key?: string;
       deltaY?: number;

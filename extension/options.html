@@ -26,6 +26,9 @@
         <label for="uploadFolders">Allowed upload folders</label>
         <p id="uploadFoldersHelp" class="help">One absolute folder per line. Default: /Volumes/NVme/Projects/Stories/. An empty list disables file uploads. Relative paths, NUL characters and .. segments are ignored. Uploads require a tab owned by the calling agent and Chrome's “Allow access to file URLs” setting for this extension.</p>
         <textarea id="uploadFolders" rows="5" spellcheck="false" aria-describedby="uploadFoldersHelp" placeholder="/Volumes/NVme/Projects/Stories/"></textarea>
+        <label for="downloadFolders">Allowed download folders</label>
+        <p id="downloadFoldersHelp" class="help">One absolute folder per line, separate from upload folders. Default: /Volumes/NVme/Projects/Stories/. An empty list disables downloads. Relative paths, NUL characters and .. segments are ignored. Downloads require a tab owned by the calling agent, use same-origin, blob or data sources, and save up to 500 MB per file without Chrome's Save As prompt.</p>
+        <textarea id="downloadFolders" rows="5" spellcheck="false" aria-describedby="downloadFoldersHelp" placeholder="/Volumes/NVme/Projects/Stories/"></textarea>
         <div class="actions"><button id="savePolicy">Save safety settings</button><span id="policyStatus" role="status"></span></div>
       </section>
       <section>

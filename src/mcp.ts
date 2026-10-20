@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { DaemonClient } from "./daemon-client.js";
 import { assertBrowserUrlAllowed } from "./url-policy.js";
 import { annotationIdSchema, annotationReplySchema, annotationStatusSchema } from "./annotations.js";
+import { assertDownloadSource } from "./download-policy.js";
 
 const httpUrl = z
   .string()
@@ -130,6 +131,20 @@ export async function runMcpServer(bridge: DaemonClient, transport: Transport = 
     },
     async ({ ref, description, snapshotId, files, mode, tabId }) =>
       text(await bridge.request({ action: "uploadFile", tabId: await selectedTab(bridge, tabId), ref, description, snapshotId, files, ...(mode === undefined ? {} : { mode }) }))
+  );
+
+  server.tool(
+    "browser_download",
+    "Save media from a tab owned by your agent label without Chrome's Save As prompt. Supply either ref + snapshotId from browser_snapshot (video/audio/source/img/a) or url, plus filename and description. URLs must be same-origin http(s), blob URLs of the tab origin, or data URLs; redirects are refused. Saves up to 500 MB in an allowed download folder from Extension options. Folder defaults to the first configured folder; subfolder must be relative. Filenames are sanitized and collisions get numeric suffixes without overwriting. Ref downloads require a current snapshot. Hand-shared, blocked and bank/card/payment/password-manager tabs cannot download. Returns saved (real path), bytes and mimeType.",
+    {
+      ref: z.string().regex(/^ubb-\d+$/).optional(), snapshotId: z.string().min(1).optional(), url: z.string().min(1).optional(),
+      filename: z.string().min(1), description: z.string().min(1),
+      folder: z.string().optional(), subfolder: z.string().optional(), tabId: z.number().int().optional()
+    },
+    async ({ tabId, ...args }) => {
+      assertDownloadSource(args);
+      return text(await bridge.request({ action: "download", tabId: await selectedTab(bridge, tabId), ...args }));
+    }
   );
 
   server.tool(
