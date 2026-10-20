@@ -30,7 +30,7 @@ let authenticated = false;
 const REVOCATION_DEBOUNCE_MS = 250;
 
 async function settings() {
-  const saved = await chrome.storage.local.get({ relayUrl: DEFAULT_URL, token: "", trustAgentOwnedTabs: true, blockedDomains: [] });
+  const saved = await chrome.storage.local.get({ relayUrl: DEFAULT_URL, token: "", trustAgentOwnedTabs: true, autoCreateAgentWindow: true, blockedDomains: [] });
   return { ...saved, blockedDomains: normalizeBlockedDomains(saved.blockedDomains) };
 }
 
@@ -282,10 +282,13 @@ async function createAgentTab(url, label) {
       return chrome.tabs.create({ windowId: agentWindowId, url, active: false });
     }
   }
-  const approved = await requestApproval(
-    `${label ? `[${label}] ` : ""}Create an agent-controlled Chrome window? Tabs opened there can use your signed-in Chrome session. First URL: ${url}`
-  );
-  if (!approved) throw new Error("User denied creation of the agent-controlled window");
+  const { autoCreateAgentWindow } = await settings();
+  if (autoCreateAgentWindow !== true) {
+    const approved = await requestApproval(
+      `${label ? `[${label}] ` : ""}Create an agent-controlled Chrome window? Tabs opened there can use your signed-in Chrome session. First URL: ${url}`
+    );
+    if (!approved) throw new Error("User denied creation of the agent-controlled window");
+  }
   await assertUnblockedTab({ url });
   const window = await chrome.windows.create({ url, focused: false });
   await chrome.storage.session.set({ agentWindowId: window.id });

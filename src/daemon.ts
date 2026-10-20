@@ -13,11 +13,11 @@ import { assertBrowserUrlAllowed, isReadOnlyBrowserUrl, assertTabNotBlocked, isB
 
 type ControlRequest = Extract<ControlClientMessage, { type: "request" }>;
 
-type ClientInfo = { socket: Socket; label?: string };
+type ClientInfo = { socket: Socket; label?: string; connected: boolean };
 
 // Sentinel lease key: serializes createTab calls (which have no tabId yet)
-// so two adapters can never both trigger the extension's one-time
-// agent-window approval/creation flow at once.
+// so adapters cannot race the agent-window creation/optional approval flow.
+// Abandoned requests are dropped or cleaned up before the next job runs.
 const CREATE_TAB_LOCK = -1;
 
 async function getUnblockedTab(bridge: BrowserBridge, tabId: number, label: string | undefined): Promise<{ url: string; pendingUrl?: string }> {
@@ -161,6 +161,7 @@ export class DaemonServer {
     let authenticated = false;
     let buffer = "";
     let clientId = "";
+    let client: ClientInfo | undefined;
     const authTimer = setTimeout(() => socket.destroy(), 3_000);
 
     const send = (message: ControlServerMessage) => {
@@ -192,7 +193,8 @@ export class DaemonServer {
           authenticated = true;
           clearTimeout(authTimer);
           clientId = message.clientId;
-          this.clients.set(clientId, { socket, label: message.label });
+          client = { socket, label: message.label, connected: true };
+          this.clients.set(clientId, client);
           send({ type: "ready", version: PROTOCOL_VERSION });
           continue;
         }
@@ -203,6 +205,7 @@ export class DaemonServer {
 
     socket.on("close", () => {
       clearTimeout(authTimer);
+      if (client) client.connected = false;
       if (!clientId) return;
       this.clients.delete(clientId);
       // An ephemeral client ID that disconnects can never come back, so hold
@@ -258,7 +261,8 @@ export class DaemonServer {
 
   private async dispatch(message: ControlRequest, clientId: string): Promise<unknown> {
     const { action, tabId } = message;
-    const label = this.clients.get(clientId)?.label;
+    const client = this.clients.get(clientId);
+    const label = client?.label;
     const unblocked = (tab: { url: string; pendingUrl?: string }) =>
       !isBlockedBrowserUrl(tab.url, this.bridge.blockedDomains) && !isBlockedBrowserUrl(tab.pendingUrl, this.bridge.blockedDomains);
 
@@ -294,9 +298,14 @@ export class DaemonServer {
 
     if (action === "createTab") {
       return this.leases.runExclusive(CREATE_TAB_LOCK, async () => {
+        if (!client?.connected) throw new Error("createTab abandoned: client disconnected");
         if (!message.url || !assertBrowserUrlAllowed(message.url)) throw new Error("Only allowed public http(s) URLs can be opened");
         assertTabNotBlocked({ url: message.url }, this.bridge.blockedDomains);
         const tab = (await this.bridge.command({ action: "createTab", url: message.url, label })) as { id: number };
+        if (!client.connected) {
+          await this.bridge.command({ action: "closeTab", tabId: tab.id, label }).catch(() => {});
+          throw new Error("createTab abandoned: client disconnected");
+        }
         if (!label) this.tabOwners.set(tab.id, clientId);
         this.knownTabIds.add(tab.id);
         return tab;

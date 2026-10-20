@@ -18,6 +18,8 @@
         <h2>Agent access</h2>
         <label class="checkbox"><input id="trustAgentOwnedTabs" type="checkbox" aria-describedby="trustHelp" />Trust agent-owned tabs</label>
         <p id="trustHelp" class="help">Skip click and Enter approval only in tabs created by the calling agent's label; hand-shared tabs still ask.</p>
+        <label class="checkbox"><input id="autoCreateAgentWindow" type="checkbox" aria-describedby="agentWindowHelp" />Let agents open their window without asking</label>
+        <p id="agentWindowHelp" class="help">Enabled by default. Any local process with the bridge token can open agent tabs in your signed-in Chrome without a prompt. Turn off to ask before creating the agent window.</p>
         <label for="blockedDomains">Blocked sites</label>
         <p id="blocklistHelp" class="help">One domain per line. Each domain and its subdomains are blocked from agent access, including hand-shared tabs.</p>
         <textarea id="blockedDomains" rows="5" spellcheck="false" aria-describedby="blocklistHelp" placeholder="example.com&#10;vault.example.org"></textarea>
@@ -29,7 +31,7 @@
           <li>The bridge listens only on your computer.</li>
           <li>Agents see only tabs you explicitly share or let them create.</li>
           <li>Bank, card, payment and password-manager pages stay read-only, even in trusted tabs.</li>
-          <li>Creating the agent window always asks for approval.</li>
+          <li>Creating the agent window asks for approval when automatic agent windows are turned off.</li>
           <li>Remove a tab by clicking the toolbar icon again.</li>
           <li>Do not share banking, password-manager, or payment tabs.</li>
         </ul>
