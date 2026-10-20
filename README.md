@@ -254,6 +254,31 @@ During a chooser call, `window.showOpenFilePicker` is temporarily replaced with 
 
 Open `chrome://extensions`, find **Universal Browser Bridge**, open **Details**, and enable **Allow access to file URLs**. Reload the updated extension and rebuild/restart the daemon and MCP adapters before using the new tool. Live Chrome uploads are a separate manual check from automated tests.
 
+### Downloading files
+
+Use `browser_download` to save media from a tab owned by your agent label directly to an allowed local folder. It fetches inside the page and transfers bytes to the daemon, so Chrome's Save As preference and the background agent window do not affect saving. Pass `filename`, `description`, and either `ref` + `snapshotId` from `browser_snapshot` or `url`. Snapshots include visible video, image and audio elements within the existing 250-element cap. Ref sources can be `<video>`, `<audio>`, `<source>`, `<img>` or `<a>`; the tool uses `currentSrc`, `src` or `href`.
+
+```json
+{
+  "ref": "ubb-3",
+  "snapshotId": "7:0",
+  "filename": "scene.mp4",
+  "description": "Save the generated scene",
+  "subfolder": "renders",
+  "tabId": 7
+}
+```
+
+For a URL source, replace `ref` and `snapshotId` with `url`. HTTP(S) URLs must have the same origin as the tab. Blob URLs must belong to that origin; data URLs are also allowed. Other schemes, cross-origin sources and redirects are refused. Downloads require a labelled agent, a tab owned by that label, and a writable, unblocked site. Hand-shared tabs cannot download files. Ref downloads require a current snapshot after navigation. The tool reads media without clicking the page.
+
+In Extension options, edit **Allowed download folders** and click **Save safety settings**. This list is separate from upload folders and defaults to `/Volumes/NVme/Projects/Stories/` only when the setting is unset. An empty list disables downloads; an older extension that does not send the policy also leaves downloads disabled. `folder` optionally selects a configured folder; the default is the first. `subfolder` is relative to it. Neither agents nor tools can edit the allowed list.
+
+Each download is limited to 500 MB (524,288,000 bytes), checked against Content-Length when present and the fetched Blob size before transfer. The daemon transfers 1 MB chunks into a private `.<name>.<id>.ubb-partial` file. It atomically publishes the completed file without overwriting existing files or following final-path symlinks. Collisions become `scene (1).mp4`, `scene (2).mp4`, and so on. The result is `{ "saved": "/real/path/renders/scene.mp4", "bytes": 12345, "mimeType": "video/mp4" }`.
+
+Filenames use only the basename, remove control characters, separators, colons and leading dots, and are trimmed to 200 characters while preserving the extension. Empty names are rejected. Subfolders cannot be absolute or contain `..` segments; each segment is sanitized, created and resolved within the real allowed folder. Symlink escapes are refused before creating further directories outside that folder.
+
+Errors remove the temporary file and attempt to release the page-held Blob. A two-minute page timer also releases abandoned fetches and Blobs when a disconnect, navigation or policy change prevents normal cleanup. Active chunk transfers refresh that timer. Download operations recheck site access and the selected folder before each page command.
+
 ## Annotations
 
 Share a normal HTTP(S) tab with the toolbar icon, then enter annotation mode with **Alt+Shift+A** (macOS: **Control+Shift+A**) or right-click the toolbar icon and choose **Annotate this tab**. The toolbar's normal click still toggles sharing. If the shortcut conflicts, change it at `chrome://extensions/shortcuts`.
@@ -353,6 +378,7 @@ Both commands use the authenticated daemon control socket, so **serve** must be 
 | `browser_click` | Scroll to and click a snapshot element with trusted mouse input (script fallback); consequential approval applies unless the caller's owned tab is trusted |
 | `browser_type` | Replace the contents of a snapshot input element with user activation |
 | `browser_upload_file` | Attach up to 10 allowed local files through an input or intercepted chooser in a caller-owned tab; modes: auto, input, chooser |
+| `browser_download` | Save same-origin, blob or data media from a caller-owned tab to an allowed download folder, up to 500 MB |
 | `browser_press` | Send trusted keyboard input; Enter and NumpadEnter require approval unless the caller's owned tab is trusted |
 | `browser_scroll` | Scroll a shared page by pixels |
 | `browser_screenshot` | Capture a PNG screenshot of a shared tab |
@@ -565,6 +591,7 @@ Chrome assigns unpacked extensions an identity based partly on their loaded dire
 - Only explicitly shared tabs are attached through `chrome.debugger`.
 - Password input values are omitted from snapshots.
 - File uploads require live ownership by the caller's label, writable/unblocked sites, and user-configured allowed folders; the daemon validates real paths, file types and sizes, and the extension independently guards attachment.
+- Downloads require a caller-owned, writable, unblocked tab and a separately configured allowed download folder. The daemon checks source origins, a 500 MB cap and real destination paths; the extension independently checks ownership, site access and the selected folder. Chunk transfers use private temporary files and atomic publication without overwrite. MCP tools cannot change download permissions.
 - Chooser uploads retain those checks and consequential-click approval. The extension rechecks access before each operation, limits interception to one upload per tab, and restores the picker shim and interception after the call. If access is revoked mid-call, cleanup still attempts to disable interception and restore the shim.
 - Navigation and new tabs accept only allowed `http:` and `https:` URLs.
 - Localhost and private-network destinations are blocked unless explicitly enabled.

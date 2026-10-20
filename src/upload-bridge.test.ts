@@ -52,3 +52,18 @@ it("ignores unauthenticated and replaced peers and resets on disconnect", () => 
   current.close();
   expect(bridge.uploadFolders).toEqual([]);
 });
+
+it("syncs download folders separately from uploads and fails closed on missing or malformed policy", () => {
+  const peer = connect({ uploadFolders: ["/uploads/"], downloadFolders: [" /media ", "/media/", "relative"] });
+  expect(bridge.downloadFolders).toEqual(["/media/"]);
+  expect(bridge.uploadFolders).toEqual(["/uploads/"]);
+  peer.push({ type: "sitePolicy", blockedDomains: [], uploadFolders: ["/uploads/"], downloadFolders: ["/new/"] });
+  expect(bridge.downloadFolders).toEqual(["/new/"]);
+  peer.push({ type: "sitePolicy", blockedDomains: [], downloadFolders: "bad" });
+  expect(bridge.downloadFolders).toEqual([]);
+  peer.push({ type: "sitePolicy", blockedDomains: [], downloadFolders: ["/new/"] });
+  peer.push({ type: "sitePolicy", blockedDomains: [] });
+  expect(bridge.downloadFolders).toEqual([]);
+  peer.close();
+  expect(bridge.downloadFolders).toEqual([]);
+});

@@ -1,5 +1,6 @@
 import { normalizeBlockedDomains } from "./url-policy.js";
 import { DEFAULT_UPLOAD_FOLDERS, normalizeUploadFolders } from "./upload-policy.js";
+import { DEFAULT_DOWNLOAD_FOLDERS, normalizeDownloadFolders } from "./download-policy.js";
 
 const relayUrl = document.querySelector("#relayUrl");
 const token = document.querySelector("#token");
@@ -9,9 +10,14 @@ const autoCreateAgentWindow = document.querySelector("#autoCreateAgentWindow");
 const blockedDomains = document.querySelector("#blockedDomains");
 const policyStatus = document.querySelector("#policyStatus");
 const uploadFolders = document.querySelector("#uploadFolders");
+const downloadFolders = document.querySelector("#downloadFolders");
 
 chrome.storage.local.get({ uploadFolders: DEFAULT_UPLOAD_FOLDERS }).then((saved) => {
   uploadFolders.value = normalizeUploadFolders(saved.uploadFolders).join("\n");
+});
+
+chrome.storage.local.get({ downloadFolders: DEFAULT_DOWNLOAD_FOLDERS }).then((saved) => {
+  downloadFolders.value = normalizeDownloadFolders(saved.downloadFolders).join("\n");
 });
 
 chrome.storage.local.get({ relayUrl: "ws://127.0.0.1:17321/extension", token: "", trustAgentOwnedTabs: true, autoCreateAgentWindow: true, blockedDomains: [] }).then((saved) => {
@@ -27,13 +33,19 @@ document.querySelector("#savePolicy").addEventListener("click", async () => {
     const entries = uploadFolders.value.split(/\r?\n/);
     const folders = normalizeUploadFolders(entries);
     const ignored = entries.filter((entry) => entry.trim() && !normalizeUploadFolders([entry]).length).length;
+    const downloadEntries = downloadFolders.value.split(/\r?\n/);
+    const downloadPaths = normalizeDownloadFolders(downloadEntries);
+    const ignoredDownloads = downloadEntries.filter((entry) => entry.trim() && !normalizeDownloadFolders([entry]).length).length;
     const domains = normalizeBlockedDomains(blockedDomains.value.split(/\r?\n/));
     await chrome.storage.local.set({ trustAgentOwnedTabs: trustAgentOwnedTabs.checked, autoCreateAgentWindow: autoCreateAgentWindow.checked, blockedDomains: domains });
     blockedDomains.value = domains.join("\n");
     await chrome.storage.local.set({ uploadFolders: folders });
     uploadFolders.value = folders.join("\n");
+    await chrome.storage.local.set({ downloadFolders: downloadPaths });
+    downloadFolders.value = downloadPaths.join("\n");
     policyStatus.textContent = "Saved. Safety settings apply immediately.";
     if (ignored) policyStatus.textContent += ` Ignored ${ignored} invalid upload folder ${ignored === 1 ? "entry" : "entries"}.`;
+    if (ignoredDownloads) policyStatus.textContent += ` Ignored ${ignoredDownloads} invalid download folder ${ignoredDownloads === 1 ? "entry" : "entries"}.`;
   } catch (error) {
     policyStatus.textContent = error.message || String(error);
   }
