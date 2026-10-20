@@ -28,6 +28,17 @@ let page: any;
 let fakeSize: number | undefined;
 let failChunk: boolean;
 let chunks: number;
+let networkUrls: string[];
+let networkIndex: number;
+let ioIndex: number;
+let networkReadError: boolean;
+let networkSizeError: boolean;
+let ioText: boolean;
+let pageResponseType: string;
+let pageFetchFailure: string | undefined;
+let pageStatus: number;
+let pageFetches: { url: string; options: { redirect: string; credentials: string } }[];
+let pageEntriesAtNetworkStart: string[][];
 const push = (message: unknown) => extension.emit("message", JSON.stringify(message));
 function authenticate(label?: string) {
   control = new Peer();
@@ -42,15 +53,22 @@ function request(body: Record<string, unknown>): Promise<any> {
   });
 }
 const download = (options: Record<string, unknown> = {}) => request({ action: "download", tabId: 7,
-  url: "https://app.example/media", filename: "clip.bin", description: "Save media", ...options });
+  url: "blob:https://app.example/media", filename: "clip.bin", description: "Save media", ...options });
 beforeEach(async () => {
   directory = await mkdtemp(join(tmpdir(), "ubb-download-protocol-"));
+  pageResponseType = "basic"; pageFetchFailure = undefined; pageStatus = 200; pageFetches = []; pageEntriesAtNetworkStart = [];
+  networkUrls = []; networkIndex = 0; ioIndex = 0; networkReadError = false; networkSizeError = false; ioText = false;
   commands = []; owned = true; fakeSize = undefined; failChunk = false; chunks = 0;
   bytes = Buffer.from([0, 1, 2, 255]); page = {};
   liveTab = { id: 7, url: "https://app.example/project", active: true };
   const context = createContext({ window: page, location: { href: liveTab.url }, URL, AbortController, Blob, Uint8Array, btoa, setTimeout, clearTimeout,
     document: { querySelector: () => ({ tagName: "VIDEO", currentSrc: "blob:https://app.example/video" }) },
-    fetch: async (url: string) => ({ ok: true, status: 200, url, headers: { get: () => null }, blob: async () => new Blob([new Uint8Array(bytes)], { type: "video/mp4" }) })
+    fetch: async (url: string, options: { redirect: string; credentials: string }) => {
+      pageFetches.push({ url, options });
+      if (pageFetchFailure) throw new Error(pageFetchFailure);
+      return { type: pageResponseType, ok: pageResponseType !== "opaqueredirect" && pageStatus >= 200 && pageStatus < 300,
+        status: pageStatus, url, headers: { get: () => null }, blob: async () => new Blob([new Uint8Array(bytes)], { type: "video/mp4" }) };
+    }
   });
   bridge = new BrowserBridge("test-token");
   daemon = new DaemonServer(bridge, "test-token", join(directory, "daemon.sock"), new AnnotationStore(join(directory, "annotations")));
@@ -69,6 +87,16 @@ beforeEach(async () => {
         if (value?.mimeType && fakeSize !== undefined) value.size = fakeSize;
         result = { result: { value } };
       } catch (error) { result = { exceptionDetails: { text: (error as Error).message } }; }
+    }
+    if (message.action === "downloadStart") pageEntriesAtNetworkStart.push(Object.keys(page.__ubbDl ?? {}));
+    if (message.action === "downloadStart" || message.action === "downloadContinue") {
+      if (networkSizeError) { push({ type: "response", id: message.id, error: "Download exceeds the 500 MB limit" }); return; }
+      result = networkIndex < networkUrls.length ? { redirectUrl: networkUrls[networkIndex++] } : { mimeType: "video/mp4" };
+    }
+    if (message.action === "downloadRead") {
+      if (networkReadError && ioIndex > 0) { push({ type: "response", id: message.id, error: "IO.read failed" }); return; }
+      const chunk = bytes.subarray(ioIndex, ioIndex + 1048576); ioIndex += chunk.length;
+      result = { data: chunk.toString(ioText ? "utf8" : "base64"), base64Encoded: !ioText, eof: ioIndex >= bytes.length };
     }
     push({ type: "response", id: message.id, result });
   })(); };
@@ -124,7 +152,7 @@ it("cleans up the page blob and partial file on mid-stream failure", async () =>
   expect(Object.keys(page.__ubbDl ?? {})).toEqual([]);
 });
 it.each(["https://other.example/media", "blob:https://other.example/media", "file:///tmp/secret"])("rejects disallowed source %s", async (url) => {
-  expect((await download({ url })).error).toMatch(/same-origin/i);
+  expect((await download({ url })).error).toMatch(/same-origin|trusted download host/i);
   expect(chunks).toBe(0);
   expect(await readdir(directory)).toEqual([]);
 });
@@ -148,4 +176,100 @@ it.each([{ url: undefined }, { ref: "ubb-3", snapshotId: "7:0" }, { url: undefin
 it.each(["setDownloadFolders", "downloadFolders", "setSitePolicy"])("refuses policy changes through control action %s", async (action) => {
   expect((await request({ action, tabId: 7, downloadFolders: ["/"] })).error).toContain("Unknown control action");
   expect(bridge.downloadFolders).toEqual([`${directory}/`]);
+});
+
+
+it("falls back after a same-origin opaqueredirect and streams exact bytes", async () => {
+  pageResponseType = "opaqueredirect";
+  bytes = Buffer.alloc(1048583, 0xab);
+  const result = await download({ url: "https://app.example/media" });
+  expect(result.error).toBeUndefined();
+  expect(await readFile(result.result.saved)).toEqual(bytes);
+  expect(result.result.bytes).toBe(bytes.length);
+  expect(commands.filter(command => command.action === "downloadRead")).toHaveLength(2);
+  expect(pageFetches).toHaveLength(1);
+  expect(pageFetches[0]).toMatchObject({ url: "https://app.example/media", options: { redirect: "manual" } });
+  expect(pageEntriesAtNetworkStart).toEqual([[]]);
+  expect(commands.some(command => command.action === "downloadCancel")).toBe(true);
+});
+it("falls back from same-origin opaqueredirect and independently checks a trusted redirect", async () => {
+  pageResponseType = "opaqueredirect";
+  push({ type: "sitePolicy", blockedDomains: [], downloadFolders: [directory], trustedDownloadHosts: ["cdn.example"] });
+  networkUrls = ["https://cdn.example/media?token=secret"];
+  const result = await download({ url: "https://app.example/media" });
+  expect(await readFile(result.result.saved)).toEqual(bytes);
+  expect(commands.filter(command => command.action === "downloadContinue")).toHaveLength(1);
+  const start = commands.find(command => command.action === "downloadStart");
+  expect(start).not.toHaveProperty("trustedDownloadHosts");
+  expect(start.description).toBe("Save media");
+  expect(pageFetches).toHaveLength(1);
+  expect(pageEntriesAtNetworkStart).toEqual([[]]);
+});
+it.each(["https://untrusted.example/private?token=secret", "http://cdn.example/private?token=secret", "https://blocked.example/private?token=secret"])(
+  "refuses fallback redirect %s without continuation or token leakage", async url => {
+    pageResponseType = "opaqueredirect";
+    push({ type: "sitePolicy", blockedDomains: ["blocked.example"], downloadFolders: [directory], trustedDownloadHosts: ["cdn.example", "blocked.example"] });
+    networkUrls = [url];
+    const result = await download({ url: "https://app.example/media" });
+    expect(result.error).toContain(new URL(url).hostname);
+    expect(result.error).not.toMatch(/private|token|secret/);
+    expect(commands.some(command => command.action === "downloadContinue")).toBe(false);
+    expect(commands.some(command => command.action === "downloadCancel")).toBe(true);
+    expect(await readdir(directory)).toEqual([]);
+  }
+);
+it("caps hops independently of the extension", async () => {
+  pageResponseType = "opaqueredirect";
+  networkUrls = Array.from({ length: 11 }, (_, index) => `https://app.example/${index}`);
+  expect((await download({ url: "https://app.example/media" })).error).toMatch(/redirect limit/i);
+  expect(commands.filter(command => command.action === "downloadContinue")).toHaveLength(10);
+});
+it("allows trusted initial HTTPS and textual IO chunks", async () => {
+  push({ type: "sitePolicy", blockedDomains: [], downloadFolders: [directory], trustedDownloadHosts: ["cdn.example"] });
+  bytes = Buffer.from("héllo"); ioText = true;
+  const result = await download({ url: "https://cdn.example/clip?token=secret" });
+  expect(result.result.bytes).toBe(bytes.length);
+  expect(await readFile(result.result.saved)).toEqual(bytes);
+  expect(pageFetches).toEqual([]);
+  expect(commands.filter(command => command.action === "downloadStart")).toHaveLength(1);
+});
+it("removes partial files and closes the network session on read failures and size failures", async () => {
+  pageResponseType = "opaqueredirect";
+  bytes = Buffer.alloc(1048577); networkReadError = true;
+  expect((await download({ url: "https://app.example/media" })).error).toContain("IO.read failed");
+  expect(await readdir(directory)).toEqual([]);
+  expect(commands.some(command => command.action === "downloadCancel")).toBe(true);
+  commands = []; networkSizeError = true;
+  expect((await download({ url: "https://app.example/media" })).error).toContain("500 MB");
+  expect(commands.some(command => command.action === "downloadRead")).toBe(false);
+  expect(commands.some(command => command.action === "downloadCancel")).toBe(true);
+});
+it.each(["setTrustedDownloadHosts", "trustedDownloadHosts", "downloadStart", "downloadContinue", "downloadRead", "downloadCancel"])(
+  "keeps internal policy and transfer action %s out of the control protocol", async action => {
+    expect((await request({ action, tabId: 7, trustedDownloadHosts: ["attack.example"] })).error).toContain("Unknown control action");
+    expect(bridge.trustedDownloadHosts).toEqual([]);
+  }
+);
+
+
+it("keeps same-origin non-redirect image downloads on the page path without Fetch.enable", async () => {
+  const result = await download({ url: "https://app.example/image.png", filename: "image.png" });
+  expect(result.error).toBeUndefined();
+  expect(await readFile(result.result.saved)).toEqual(bytes);
+  expect(pageFetches).toHaveLength(1);
+  expect(pageFetches[0]).toMatchObject({ options: { redirect: "manual", credentials: "same-origin" } });
+  expect(commands.some(command => command.action === "downloadStart" || command.method === "Fetch.enable")).toBe(false);
+  expect(Object.keys(page.__ubbDl ?? {})).toEqual([]);
+});
+it.each(["network error", "HTTP error", "opaque response", "size limit"])("preserves same-origin page %s without interception fallback", async reason => {
+  if (reason === "network error") pageFetchFailure = "Page fetch failed";
+  if (reason === "HTTP error") pageStatus = 404;
+  if (reason === "opaque response") { pageResponseType = "opaque"; pageStatus = 0; }
+  if (reason === "size limit") fakeSize = 524288001;
+  const result = await download({ url: "https://app.example/media" });
+  expect(result.error).toMatch(/Page fetch failed|HTTP 404|HTTP 0|500 MB/);
+  expect(pageFetches).toHaveLength(1);
+  expect(commands.some(command => command.action === "downloadStart")).toBe(false);
+  expect(Object.keys(page.__ubbDl ?? {})).toEqual([]);
+  expect(await readdir(directory)).toEqual([]);
 });

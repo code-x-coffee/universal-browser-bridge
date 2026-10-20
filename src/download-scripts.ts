@@ -9,7 +9,7 @@ export function downloadSourceScript(source: { ref?: string; url?: string }): st
       const el = document.querySelector('[data-ubb-ref="' + source.ref + '"]');
       if (!el) throw new Error('Element ref expired; take a new snapshot');
       if (!['VIDEO', 'AUDIO', 'SOURCE', 'IMG', 'A'].includes(el.tagName)) throw new Error('Element is not a downloadable media source or link');
-      url = el.currentSrc || el.src || el.href;
+      url = el.currentSrc || el.src || (['VIDEO', 'AUDIO'].includes(el.tagName) ? el.querySelector('source')?.src : undefined) || el.href;
     }
     if (!url) throw new Error('Element has no downloadable source URL');
     return new URL(url, location.href).href;
@@ -26,7 +26,13 @@ export function downloadFetchScript(key: string, url: string): string {
     entry.timer = setTimeout(entry.expire, 120000);
     store[key] = entry;
     try {
-      const response = await fetch(url, { credentials: 'same-origin', redirect: 'error', signal: entry.controller.signal });
+      const manualRedirect = /^https?:/.test(url);
+      const response = await fetch(url, { credentials: 'same-origin', redirect: manualRedirect ? 'manual' : 'error', signal: entry.controller.signal });
+      if (manualRedirect && response.type === 'opaqueredirect') {
+        clearTimeout(entry.timer);
+        entry.expire();
+        return { redirected: true };
+      }
       if (!response.ok) throw new Error('Download fetch failed (HTTP ' + response.status + ')');
       if (response.url) (${assertDownloadUrl.toString()})(response.url, location.href);
       const length = Number(response.headers.get('content-length'));

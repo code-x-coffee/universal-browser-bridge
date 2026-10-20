@@ -10,15 +10,26 @@ export const snapshotScript = String.raw`
     const rect = el.getBoundingClientRect();
     return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
   };
-  const nodes = [...document.querySelectorAll('a,button,input,label,textarea,select,video,img,audio,[role],[contenteditable="true"]')]
-    .filter(visible)
+  const nodes = [...document.querySelectorAll('a,button,input,label,textarea,select,video,img,audio,source,[role],[contenteditable="true"]')]
+    .filter(el => el.tagName === 'SOURCE' ? el.parentElement && visible(el.parentElement) : visible(el))
     .slice(0, 250)
     .map((el, index) => {
       const ref = 'ubb-' + index;
       el.setAttribute('data-ubb-ref', ref);
       const rect = el.getBoundingClientRect();
+      let srcHost;
+      if (['VIDEO', 'AUDIO', 'SOURCE'].includes(el.tagName)) {
+        const src = el.currentSrc || el.src || el.querySelector?.('source')?.src;
+        if (src) {
+          try {
+            const url = new URL(src, location.href);
+            srcHost = ['blob:', 'data:'].includes(url.protocol) ? url.protocol : url.hostname || undefined;
+          } catch {} // Malformed source URLs must never escape through diagnostics.
+        }
+      }
       return {
         ref,
+        srcHost,
         tag: el.tagName.toLowerCase(),
         role: el.getAttribute('role') || undefined,
         type: el.getAttribute('type') || undefined,

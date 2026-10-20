@@ -120,3 +120,20 @@ it("saves normalized download folders separately and reports ignored entries", a
   await field("savePolicy").events.get("click")!();
   expect(await mock.chrome.storage.local.get("downloadFolders")).toEqual({ downloadFolders: [] });
 });
+
+it("loads trusted hosts with an empty default and saves normalized hosts with ignored counts", async () => {
+  await load();
+  expect(field("trustedDownloadHosts")?.value).toBe("");
+  field("trustedDownloadHosts").value = " CDN.Example.\ncdn.example\nhttps://bad.example/path\n*.example.com\n127.0.0.1\n\n";
+  await field("savePolicy").events.get("click")!();
+  expect(await mock.chrome.storage.local.get("trustedDownloadHosts")).toEqual({ trustedDownloadHosts: ["cdn.example"] });
+  expect(field("trustedDownloadHosts").value).toBe("cdn.example");
+  expect(field("policyStatus").textContent).toContain("Ignored 3 invalid trusted download host entries");
+});
+it("loads existing trusted hosts and can disable them", async () => {
+  await load({ trustedDownloadHosts: [" CDN.Example. ", "cdn.example"] });
+  expect(field("trustedDownloadHosts").value).toBe("cdn.example");
+  field("trustedDownloadHosts").value = "";
+  await field("savePolicy").events.get("click")!();
+  expect(await mock.chrome.storage.local.get("trustedDownloadHosts")).toEqual({ trustedDownloadHosts: [] });
+});

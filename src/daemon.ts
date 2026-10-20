@@ -13,7 +13,7 @@ import { clickDetailsScript, clickTargetScript, clickScript, describeKey, scroll
 import { TabLeaseManager } from "./tab-lease.js";
 import { assertBrowserUrlAllowed, isReadOnlyBrowserUrl, assertTabNotBlocked, isBlockedBrowserUrl } from "./url-policy.js";
 import { validateUploadFiles } from "./upload-policy.js";
-import { assertDownloadSource, prepareDownloadDestination, saveDownload } from "./download-policy.js";
+import { assertDownloadSource, prepareDownloadDestination, saveDownload, saveDownloadStream, DOWNLOAD_CHUNK_BYTES } from "./download-policy.js";
 import { assertDownloadUrl } from "../extension/download-policy.js";
 import { downloadSourceScript, downloadFetchScript, downloadChunkScript, downloadCleanupScript } from "./download-scripts.js";
 
@@ -425,25 +425,82 @@ export class DaemonServer {
         const tab = await getUnblockedTab(this.bridge, tabId, label);
         assertTabWritable(tab);
         if (message.ref !== undefined) this.assertGenerationCurrent(tabId, message.snapshotId);
-        if (message.url !== undefined) assertDownloadUrl(message.url, tab.url);
+        if (message.url !== undefined) assertDownloadUrl(message.url, tab.url, this.bridge.trustedDownloadHosts, { blockedDomains: this.bridge.blockedDomains });
         const destination = await prepareDownloadDestination(message, this.bridge.downloadFolders);
         const options = { requiresWritable: true, downloadFolder: destination.folder };
         const source = await evaluate(this.bridge, tabId, label, downloadSourceScript({ ref: message.ref, url: message.url }), options);
         const live = await getUnblockedTab(this.bridge, tabId, label);
-        const url = assertDownloadUrl(source, live.url);
+        const url = assertDownloadUrl(source, live.url, this.bridge.trustedDownloadHosts, { blockedDomains: this.bridge.blockedDomains });
+        if (message.ref !== undefined) this.assertGenerationCurrent(tabId, message.snapshotId);
         const key = randomUUID();
-        try {
-          const metadata = (await evaluate(this.bridge, tabId, label, downloadFetchScript(key, url), {
-            ...options, userGesture: true, timeoutMs: 125_000
-          })) as { size: number; mimeType: string };
-          if (!metadata || typeof metadata.mimeType !== "string") throw new Error("Chrome did not return download metadata");
-          const saved = await saveDownload(destination, metadata.size, (offset, length) =>
-            evaluate(this.bridge, tabId, label, downloadChunkScript(key, offset, length), options));
-          return { saved, bytes: metadata.size, mimeType: metadata.mimeType };
-        } finally {
-          // A page timer also expires entries if the connection or tab policy
-          // prevents this cleanup command from reaching the original document.
-          await evaluate(this.bridge, tabId, label, downloadCleanupScript(key), options).catch(() => {});
+        const httpSource = /^https?:/.test(url);
+        const sameOriginHttp = httpSource && new URL(url).origin === new URL(live.url).origin;
+        if (!httpSource || sameOriginHttp) {
+          try {
+            const metadata = (await evaluate(this.bridge, tabId, label, downloadFetchScript(key, url), {
+              ...options, userGesture: true, timeoutMs: 125_000
+            })) as { redirected?: boolean; size: number; mimeType: string };
+            if (!sameOriginHttp || metadata?.redirected !== true) {
+              if (!metadata || typeof metadata.mimeType !== "string") throw new Error("Chrome did not return download metadata");
+              const saved = await saveDownload(destination, metadata.size, (offset, length) =>
+                evaluate(this.bridge, tabId, label, downloadChunkScript(key, offset, length), options));
+              return { saved, bytes: metadata.size, mimeType: metadata.mimeType };
+            }
+            // Preserve the working page-Blob path for non-redirecting same-origin
+            // URLs. A manual opaqueredirect hides Location, so request that URL a
+            // second time through interception to validate every redirect hop.
+          } finally {
+            // Release the page entry before interception fallback, including
+            // after errors. A page timer also expires abandoned Blob entries.
+            await evaluate(this.bridge, tabId, label, downloadCleanupScript(key), options).catch(() => {});
+          }
+        }
+        if (httpSource) {
+          const bridge = this.bridge;
+          let currentUrl = url;
+          let redirects = 0;
+          const generation = this.leases.getGeneration(tabId);
+          const check = async () => {
+            const tab = await getUnblockedTab(bridge, tabId, label);
+            assertTabWritable(tab);
+            if (this.leases.getGeneration(tabId) !== generation) throw new Error("Tab navigated during download; start again");
+            if (!bridge.downloadFolders.includes(destination.folder)) throw new Error("Download folder is no longer in the allowed download folders");
+            assertDownloadUrl(currentUrl, tab.url, bridge.trustedDownloadHosts, { redirect: redirects > 0, blockedDomains: bridge.blockedDomains });
+          };
+          const transfer = { tabId, label, downloadFolder: destination.folder, downloadKey: key };
+          try {
+            await check();
+            let metadata = await bridge.command({ action: "downloadStart", ...transfer, url, description: message.description }, 135000) as any;
+            while (metadata?.redirectUrl !== undefined) {
+              if (++redirects > 10) throw new Error("Download redirect limit exceeded (10 hops)");
+              currentUrl = metadata.redirectUrl;
+              await check(); // The extension holds the previous response until this check passes.
+              metadata = await bridge.command({ action: "downloadContinue", ...transfer }, 135000);
+            }
+            if (!metadata || typeof metadata.mimeType !== "string") throw new Error("Chrome did not return download metadata");
+            async function* chunks() {
+              for (;;) {
+                await check();
+                const chunk = await bridge.command({ action: "downloadRead", ...transfer }, 35000) as any;
+                if (!chunk || typeof chunk.data !== "string" || typeof chunk.eof !== "boolean"
+                  || typeof chunk.base64Encoded !== "boolean" || chunk.data.length > DOWNLOAD_CHUNK_BYTES * 2) throw new Error("Invalid download IO chunk");
+                const data = Buffer.from(chunk.data, chunk.base64Encoded ? "base64" : "utf8");
+                if (data.length > DOWNLOAD_CHUNK_BYTES || (chunk.base64Encoded && data.toString("base64") !== chunk.data)) throw new Error("Invalid download IO chunk encoding or length");
+                yield data;
+                if (chunk.eof) break;
+              }
+              await check();
+              // Finish Chrome cleanup before publication, so an incomplete
+              // cancellation leaves only a removable partial file.
+              await bridge.command({ action: "downloadCancel", ...transfer }, 30000);
+              await check(); // Also revalidate before atomic publication.
+            }
+            const result = await saveDownloadStream(destination, chunks());
+            return { ...result, mimeType: metadata.mimeType };
+          } finally {
+            // This is an internal cleanup action, never an exposed control action.
+            await bridge.command({ action: "downloadCancel", ...transfer }, 15000).catch(() => {});
+          }
         }
       });
     }

@@ -27,8 +27,11 @@
         <p id="uploadFoldersHelp" class="help">One absolute folder per line. Default: /Volumes/NVme/Projects/Stories/. An empty list disables file uploads. Relative paths, NUL characters and .. segments are ignored. Uploads require a tab owned by the calling agent and Chrome's “Allow access to file URLs” setting for this extension.</p>
         <textarea id="uploadFolders" rows="5" spellcheck="false" aria-describedby="uploadFoldersHelp" placeholder="/Volumes/NVme/Projects/Stories/"></textarea>
         <label for="downloadFolders">Allowed download folders</label>
-        <p id="downloadFoldersHelp" class="help">One absolute folder per line, separate from upload folders. Default: /Volumes/NVme/Projects/Stories/. An empty list disables downloads. Relative paths, NUL characters and .. segments are ignored. Downloads require a tab owned by the calling agent, use same-origin, blob or data sources, and save up to 500 MB per file without Chrome's Save As prompt.</p>
+        <p id="downloadFoldersHelp" class="help">One absolute folder per line, separate from upload folders. Default: /Volumes/NVme/Projects/Stories/. An empty list disables downloads. Relative paths, NUL characters and .. segments are ignored. Downloads require a tab owned by the calling agent, use same-origin, trusted HTTPS, blob or data sources, and save up to 500 MB per file without Chrome's Save As prompt.</p>
         <textarea id="downloadFolders" rows="5" spellcheck="false" aria-describedby="downloadFoldersHelp" placeholder="/Volumes/NVme/Projects/Stories/"></textarea>
+        <label for="trustedDownloadHosts">Trusted download hosts</label>
+        <p id="trustedDownloadHostsHelp" class="help">One exact hostname per line (for example storage.googleapis.com). Empty by default. Allows cross-origin HTTPS downloads and redirects to these hosts, with cookies kept inside Chrome. Every redirect must use HTTPS and be same-origin or trusted; blocklisted hosts stay blocked. Snapshots and errors show the source hostname. Bare ASCII DNS hostnames only, no schemes, paths, ports, IP literals or wildcards. Subdomains must be listed separately. Invalid entries are ignored.</p>
+        <textarea id="trustedDownloadHosts" rows="5" spellcheck="false" aria-describedby="trustedDownloadHostsHelp" placeholder="storage.googleapis.com"></textarea>
         <div class="actions"><button id="savePolicy">Save safety settings</button><span id="policyStatus" role="status"></span></div>
       </section>
       <section>

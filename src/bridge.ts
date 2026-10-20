@@ -6,7 +6,7 @@ import { PROTOCOL_VERSION, type AnnotationExtensionMessage, type BridgeCommand, 
 import { tokensMatch } from "./auth.js";
 import { normalizeBlockedDomains } from "./url-policy.js";
 import { normalizeUploadFolders } from "./upload-policy.js";
-import { normalizeDownloadFolders } from "../extension/download-policy.js";
+import { normalizeDownloadFolders, normalizeTrustedDownloadHosts } from "../extension/download-policy.js";
 
 type Pending = { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout };
 
@@ -22,6 +22,7 @@ export class BrowserBridge extends EventEmitter {
   private siteBlocklist: string[] = [];
   private allowedUploadFolders: string[] = [];
   private allowedDownloadFolders: string[] = [];
+  private trustedHosts: string[] = [];
 
   constructor(
     private readonly token: string,
@@ -45,6 +46,10 @@ export class BrowserBridge extends EventEmitter {
 
   get downloadFolders(): readonly string[] {
     return this.allowedDownloadFolders;
+  }
+
+  get trustedDownloadHosts(): readonly string[] {
+    return this.trustedHosts;
   }
 
   async start(): Promise<void> {
@@ -137,6 +142,7 @@ export class BrowserBridge extends EventEmitter {
         this.extension = ws;
         this.allowedUploadFolders = normalizeUploadFolders(message.uploadFolders);
         this.allowedDownloadFolders = normalizeDownloadFolders(message.downloadFolders);
+        this.trustedHosts = normalizeTrustedDownloadHosts(message.trustedDownloadHosts);
         this.emit("connected");
         ws.send(JSON.stringify({ type: "ready", version: PROTOCOL_VERSION }));
         ws.send(JSON.stringify({ type: "command", id: randomUUID(), action: "listTabs" }));
@@ -157,6 +163,7 @@ export class BrowserBridge extends EventEmitter {
       if (message.type === "sitePolicy") {
         this.allowedUploadFolders = normalizeUploadFolders(message.uploadFolders);
         this.allowedDownloadFolders = normalizeDownloadFolders(message.downloadFolders);
+        this.trustedHosts = normalizeTrustedDownloadHosts(message.trustedDownloadHosts);
         try {
           this.siteBlocklist = normalizeBlockedDomains(message.blockedDomains);
         } catch {
@@ -193,6 +200,7 @@ export class BrowserBridge extends EventEmitter {
         this.extension = undefined;
         this.allowedUploadFolders = [];
         this.allowedDownloadFolders = [];
+        this.trustedHosts = [];
         this.emit("disconnected");
         this.tabs = [];
         this.emit("tabs", this.tabs);

@@ -21,7 +21,7 @@ beforeEach(() => {
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
 
 it.each(["VIDEO", "AUDIO", "SOURCE", "IMG", "A"])("resolves a %s ref using currentSrc, src or href", (tagName) => {
-  element = { tagName, href: "https://app.example/anchor" };
+  element = { tagName, querySelector: () => null, href: "https://app.example/anchor" };
   expect(run(downloadSourceScript({ ref: "ubb-3" }))).toBe("https://app.example/anchor");
   element.src = "/media";
   expect(run(downloadSourceScript({ ref: "ubb-3" }))).toBe("https://app.example/media");
@@ -37,7 +37,7 @@ it("rejects expired refs and elements without a downloadable media source", () =
 it.each(["https://app.example/media", "blob:https://app.example/media", "data:text/plain,hello"])(
   "fetches allowed URL %s into page-held storage and transfers exact chunks", async (url) => {
     expect(await run(downloadFetchScript("key", url))).toEqual({ size: 4, mimeType: "video/mp4" });
-    expect(fetchPage).toHaveBeenCalledWith(url, expect.objectContaining({ redirect: "error", credentials: "same-origin" }));
+    expect(fetchPage).toHaveBeenCalledWith(url, expect.objectContaining({ redirect: url.startsWith("https:") ? "manual" : "error", credentials: "same-origin" }));
     expect(await run(downloadChunkScript("key", 1, 3))).toBe("AQL/");
     run(downloadCleanupScript("key"));
     expect(Object.keys(page.__ubbDl ?? {})).toEqual([]);
@@ -45,7 +45,7 @@ it.each(["https://app.example/media", "blob:https://app.example/media", "data:te
 );
 it.each(["https://other.example/media", "blob:https://other.example/media", "file:///etc/passwd", "javascript:alert(1)"])(
   "refuses disallowed URL %s before fetching", async (url) => {
-    await expect(run(downloadFetchScript("key", url))).rejects.toThrow(/same-origin/i);
+    await expect(run(downloadFetchScript("key", url))).rejects.toThrow(/same-origin|trusted download host/i);
     expect(fetchPage).not.toHaveBeenCalled();
   }
 );
@@ -80,4 +80,39 @@ it("makes visible video, image and audio refs available while keeping the 250 ca
   }));
   expect(snapshot.nodes).toHaveLength(250);
   expect(snapshot.nodes.slice(0, 3).map((node: any) => node.tag)).toEqual(["video", "img", "audio"]);
+});
+
+it.each(["VIDEO", "AUDIO"])("resolves the first source child of a %s with no own src", (tagName) => {
+  element = { tagName, currentSrc: "", src: "", querySelector: () => ({ src: "https://cdn.example/clip?token=secret" }) };
+  expect(run(downloadSourceScript({ ref: "ubb-3" }))).toBe("https://cdn.example/clip?token=secret");
+  element.src = "https://app.example/own";
+  expect(run(downloadSourceScript({ ref: "ubb-3" }))).toBe("https://app.example/own");
+  element.currentSrc = "blob:https://app.example/current";
+  expect(run(downloadSourceScript({ ref: "ubb-3" }))).toBe("blob:https://app.example/current");
+});
+it("discovers media hostnames including non-rendered source children without exposing URL tokens", () => {
+  const node = (tagName: string, src: string, width = 20) => ({ tagName, src, innerText: "", disabled: false,
+    getAttribute: () => null, setAttribute: vi.fn(), getBoundingClientRect: () => ({ x: 0, y: 0, width, height: width }) });
+  const video = node("VIDEO", "https://fallback.example/private?secret=ignored");
+  Object.assign(video, { currentSrc: "https://CDN.example/private?token=secret#fragment" });
+  const source = node("SOURCE", "https://source.example/private?token=secret", 0);
+  Object.assign(source, { parentElement: video });
+  const nodes = [video, source, node("AUDIO", "blob:https://app.example/private"), node("AUDIO", "data:audio/wav;base64,secret")];
+  const snapshot = runInContext(snapshotScript, createContext({ URL,
+    document: { title: "Media", querySelectorAll: (selector: string) => selector === "[data-ubb-ref]" ? [] : nodes },
+    getComputedStyle: () => ({ display: "block", visibility: "visible" }), location: { href: "https://app.example/" }
+  }));
+  expect(snapshot.nodes.map((n: any) => n.srcHost)).toEqual(["cdn.example", "source.example", "blob:", "data:"]);
+  expect(JSON.stringify(snapshot)).not.toMatch(/private|token|secret|fragment|fallback/);
+});
+
+
+it("releases the same-origin page entry and signals opaqueredirect without reading a body", async () => {
+  const readBlob = vi.fn(async () => blob);
+  fetchPage.mockResolvedValue({ type: "opaqueredirect", ok: false, status: 0, blob: readBlob });
+  expect(await run(downloadFetchScript("key", "https://app.example/media"))).toEqual({ redirected: true });
+  expect(fetchPage).toHaveBeenCalledWith("https://app.example/media", expect.objectContaining({ redirect: "manual" }));
+  expect(readBlob).not.toHaveBeenCalled();
+  expect(Object.keys(page.__ubbDl ?? {})).toEqual([]);
+  expect(vi.getTimerCount()).toBe(0);
 });

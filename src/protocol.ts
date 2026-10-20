@@ -17,8 +17,8 @@ export type ExtensionDiagnostic = { type: "diagnostic"; event: string; tabId: nu
 
 export type ExtensionMessage =
   | ExtensionDiagnostic
-  | { type: "hello"; token: string; version: number; blockedDomains?: string[]; uploadFolders?: string[]; downloadFolders?: string[] }
-  | { type: "sitePolicy"; blockedDomains: string[]; uploadFolders?: string[]; downloadFolders?: string[] }
+  | { type: "hello"; token: string; version: number; blockedDomains?: string[]; uploadFolders?: string[]; downloadFolders?: string[]; trustedDownloadHosts?: string[] }
+  | { type: "sitePolicy"; blockedDomains: string[]; uploadFolders?: string[]; downloadFolders?: string[]; trustedDownloadHosts?: string[] }
   | { type: "tabs"; tabs: SharedTab[] }
   | { type: "response"; id: string; result?: unknown; error?: string }
   | { type: "event"; tabId: number; method: string; params: unknown }
@@ -34,13 +34,14 @@ export type AnnotationExtensionMessage =
 export type BridgeCommand = {
   type: "command";
   id: string;
-  action: "listTabs" | "listAgentTabs" | "getTab" | "createTab" | "closeTab" | "requestApproval" | "cdp" | "uploadViaFileChooser";
+  action: "listTabs" | "listAgentTabs" | "getTab" | "createTab" | "closeTab" | "requestApproval" | "cdp" | "uploadViaFileChooser" | "downloadStart" | "downloadContinue" | "downloadRead" | "downloadCancel";
   label?: string;
   tabId?: number;
   method?: string;
   params?: Record<string, unknown>;
   requiresWritable?: boolean;
   downloadFolder?: string;
+  downloadKey?: string;
   url?: string;
   description?: string;
   files?: string[];
