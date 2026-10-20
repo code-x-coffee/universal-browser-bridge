@@ -1,7 +1,8 @@
 import { isReadOnlyBrowserUrl, normalizeBlockedDomains, isBlockedBrowserUrl, assertTabNotBlocked } from "./url-policy.js";
 import { DEFAULT_UPLOAD_FOLDERS, normalizeUploadFolders } from "./upload-policy.js";
+import { networkDownload, cancelNetworkDownloads } from "./network-download.js";
 import { uploadViaFileChooser } from "./file-chooser.js";
-import { DEFAULT_DOWNLOAD_FOLDERS, normalizeDownloadFolders } from "./download-policy.js";
+import { DEFAULT_DOWNLOAD_FOLDERS, normalizeDownloadFolders, normalizeTrustedDownloadHosts, assertDownloadUrl } from "./download-policy.js";
 
 const PROTOCOL_VERSION = 1;
 const DEFAULT_URL = "ws://127.0.0.1:17321/extension";
@@ -64,12 +65,19 @@ async function downloadSettings() {
   return { downloadFolders: normalizeDownloadFolders(downloadFolders) };
 }
 
+async function trustedDownloadSettings() {
+  const { trustedDownloadHosts } = await chrome.storage.local.get({ trustedDownloadHosts: [] });
+  return { trustedDownloadHosts: normalizeTrustedDownloadHosts(trustedDownloadHosts) };
+}
+
 async function connect() {
   authenticated = false;
+  await cancelNetworkDownloads();
   clearTimeout(reconnectTimer);
   const { relayUrl, token, blockedDomains } = await settings();
   const { uploadFolders } = await uploadSettings();
   const { downloadFolders } = await downloadSettings();
+  const { trustedDownloadHosts } = await trustedDownloadSettings();
   if (!token) {
     setGlobalBadge("?", "#b45309");
     return;
@@ -80,7 +88,7 @@ async function connect() {
   previous?.close();
   connection.addEventListener("open", () => {
     if (socket !== connection) return;
-    connection.send(JSON.stringify({ type: "hello", token, version: PROTOCOL_VERSION, blockedDomains, uploadFolders, downloadFolders }));
+    connection.send(JSON.stringify({ type: "hello", token, version: PROTOCOL_VERSION, blockedDomains, uploadFolders, downloadFolders, trustedDownloadHosts }));
     // Regular WebSocket traffic keeps the MV3 service worker alive (Chrome 116+
     // resets the 30s idle timer on each message).
     clearInterval(keepaliveTimer);
@@ -92,6 +100,7 @@ async function connect() {
   connection.addEventListener("close", () => {
     if (socket !== connection) return;
     authenticated = false;
+    void cancelNetworkDownloads();
     for (const pending of pendingAnnotations.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error("Annotation daemon disconnected"));
@@ -193,6 +202,20 @@ async function handleMessage(message) {
       if (message.method === "DOM.setFileInputFiles") await assertFileUploadAllowed(message, tab);
       result = await chrome.debugger.sendCommand({ tabId: message.tabId }, message.method, message.params || {});
     }
+    if (["downloadStart", "downloadContinue", "downloadRead", "downloadCancel"].includes(message.action)) {
+      const generation = tabGenerations.get(message.tabId) || 0;
+      result = await networkDownload(message, async (url, redirect) => {
+        if (typeof message.description !== "string" || !message.description.trim()) throw new Error("A description is required for downloads");
+        const tab = await assertControlledTab(message.tabId, message.label);
+        await assertDownloadAllowed(message, tab);
+        if ((tabGenerations.get(message.tabId) || 0) !== generation) throw new Error("Tab navigated during download; start again");
+        // Never accept a trusted list supplied by the daemon. Read our storage
+        // again before each hop and IO read so changes take effect immediately.
+        const { trustedDownloadHosts } = await trustedDownloadSettings();
+        const { blockedDomains } = await settings();
+        return assertDownloadUrl(url, tab.url, trustedDownloadHosts, { redirect, blockedDomains });
+      });
+    }
     if (message.action === "uploadViaFileChooser") {
       result = await uploadViaFileChooser(message, async () => {
         const tab = await assertControlledTab(message.tabId, message.label);
@@ -214,7 +237,8 @@ async function sendSitePolicy() {
   const { blockedDomains } = await settings();
   const { uploadFolders } = await uploadSettings();
   const { downloadFolders } = await downloadSettings();
-  if (authenticated) send({ type: "sitePolicy", blockedDomains, uploadFolders, downloadFolders });
+  const { trustedDownloadHosts } = await trustedDownloadSettings();
+  if (authenticated) send({ type: "sitePolicy", blockedDomains, uploadFolders, downloadFolders, trustedDownloadHosts });
 }
 
 async function assertFileUploadAllowed(message, tab) {
@@ -243,6 +267,7 @@ async function assertFileUploadAllowed(message, tab) {
 
 async function assertDownloadAllowed(message, tab) {
   if (!message.label || agentTabOwners.get(message.tabId)?.label !== message.label) throw new Error("Downloads require a tab owned by your agent label");
+  await assertUnblockedTab(tab);
   assertWritableTab(tab);
   const { downloadFolders } = await downloadSettings();
   if (!downloadFolders.length) throw new Error("File downloads are disabled: no allowed download folders are configured in Extension options");
@@ -309,6 +334,7 @@ async function shareTab(tabId, label) {
 }
 
 async function unshareTab(tabId, { ungroup = true, notify = true } = {}) {
+  await cancelNetworkDownloads(tabId);
   cancelReattach(tabId);
   if (!sharedTabs.has(tabId)) return;
   const inside = ungroup && await isInAgentGroup(tabId);
@@ -767,6 +793,7 @@ chrome.action.onClicked.addListener(async (tab) => {
 });
 
 chrome.debugger.onDetach.addListener(({ tabId }, reason) => {
+  void cancelNetworkDownloads(tabId, true);
   const owner = agentTabOwners.get(tabId);
   diagnostic("debuggerDetached", tabId, reason, owner?.label);
   if (intentionalDetach.has(tabId)) return;
@@ -775,6 +802,7 @@ chrome.debugger.onDetach.addListener(({ tabId }, reason) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  void cancelNetworkDownloads(tabId, true);
   cancelReattach(tabId); reattachAttempts.delete(tabId);
   tabGenerations.delete(tabId);
   sharedTabs.delete(tabId);
@@ -786,7 +814,10 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status === "loading" || changeInfo.url) tabGenerations.set(tabId, (tabGenerations.get(tabId) || 0) + 1);
+  if (changeInfo.status === "loading" || changeInfo.url) {
+    tabGenerations.set(tabId, (tabGenerations.get(tabId) || 0) + 1);
+    void cancelNetworkDownloads(tabId);
+  }
   if (sharedTabs.has(tabId) && (changeInfo.status === "complete" || changeInfo.url)) {
     void refreshAnnotations(tabId).catch(() => {});
   }
@@ -830,7 +861,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && (changes.token || changes.relayUrl)) void connect();
-  if (area === "local" && (changes.blockedDomains || changes.uploadFolders || changes.downloadFolders)) void sendSitePolicy().then(sendTabs);
+  if (area === "local" && (changes.blockedDomains || changes.uploadFolders || changes.downloadFolders || changes.trustedDownloadHosts)) void sendSitePolicy().then(sendTabs);
 });
 
 const tabStateReady = restoreAgentTabs().then(restoreSharedTabs);

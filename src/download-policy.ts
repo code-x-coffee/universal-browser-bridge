@@ -1,10 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { link, mkdir, open, realpath, rm, stat } from "node:fs/promises";
 import { extname, isAbsolute, join, relative, sep, win32 } from "node:path";
-import { normalizeDownloadFolders } from "../extension/download-policy.js";
+import { normalizeDownloadFolders, MAX_DOWNLOAD_BYTES, DOWNLOAD_CHUNK_BYTES } from "../extension/download-policy.js";
 
-export const MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024;
-export const DOWNLOAD_CHUNK_BYTES = 1024 * 1024;
+export { MAX_DOWNLOAD_BYTES, DOWNLOAD_CHUNK_BYTES };
 type Destination = { directory: string; filename: string; folder: string };
 
 export function assertDownloadSource(request: { ref?: unknown; snapshotId?: unknown; url?: unknown }): void {
@@ -63,16 +62,30 @@ export async function saveDownload(
 ): Promise<string> {
   if (!Number.isSafeInteger(size) || size < 0) throw new Error("Invalid download size");
   if (size > MAX_DOWNLOAD_BYTES) throw new Error("Download exceeds the 500 MB limit");
-  const { directory, filename } = destination;
-  const partial = join(directory, `.${filename}.${randomUUID()}.ubb-partial`);
-  const file = await open(partial, "wx", 0o600);
-  try {
+  async function* chunks() {
     for (let offset = 0; offset < size; offset += DOWNLOAD_CHUNK_BYTES) {
       const length = Math.min(DOWNLOAD_CHUNK_BYTES, size - offset);
       const encoded = await readChunk(offset, length);
       if (typeof encoded !== "string" || encoded.length !== Math.ceil(length / 3) * 4) throw new Error("Invalid download chunk length");
       const chunk = Buffer.from(encoded, "base64");
       if (chunk.length !== length || chunk.toString("base64") !== encoded) throw new Error("Invalid download chunk encoding or length");
+      yield chunk;
+    }
+  }
+  return (await saveDownloadStream(destination, chunks())).saved;
+}
+
+export async function saveDownloadStream(
+  destination: Destination, chunks: AsyncIterable<Uint8Array>
+): Promise<{ saved: string; bytes: number }> {
+  const { directory, filename } = destination;
+  const partial = join(directory, `.${filename}.${randomUUID()}.ubb-partial`);
+  const file = await open(partial, "wx", 0o600);
+  let bytes = 0;
+  try {
+    for await (const chunk of chunks) {
+      bytes += chunk.byteLength;
+      if (bytes > MAX_DOWNLOAD_BYTES) throw new Error("Download exceeds the 500 MB limit");
       await file.writeFile(chunk);
     }
     await file.close();
@@ -85,7 +98,7 @@ export async function saveDownload(
       try {
         // link is atomic and refuses existing paths, including symlinks.
         await link(partial, saved);
-        return saved;
+        return { saved, bytes };
       } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
     }
   } finally {

@@ -67,3 +67,19 @@ it("syncs download folders separately from uploads and fails closed on missing o
   peer.close();
   expect(bridge.downloadFolders).toEqual([]);
 });
+
+it("syncs exact trusted download hosts through hello/sitePolicy, failing closed and ignoring replaced peers", () => {
+  const old = connect({ trustedDownloadHosts: ["OLD.example.", "*.example"] });
+  expect(bridge.trustedDownloadHosts).toEqual(["old.example"]);
+  const current = connect({ trustedDownloadHosts: [" CDN.Example. ", "cdn.example", "https://invalid"] });
+  old.push({ type: "sitePolicy", blockedDomains: [], trustedDownloadHosts: ["attack.example"] });
+  expect(bridge.trustedDownloadHosts).toEqual(["cdn.example"]);
+  current.push({ type: "sitePolicy", blockedDomains: [], trustedDownloadHosts: ["new.example"] });
+  expect(bridge.trustedDownloadHosts).toEqual(["new.example"]);
+  current.push({ type: "sitePolicy", blockedDomains: [] });
+  expect(bridge.trustedDownloadHosts).toEqual([]);
+  current.push({ type: "sitePolicy", blockedDomains: [], trustedDownloadHosts: "bad" });
+  expect(bridge.trustedDownloadHosts).toEqual([]);
+  current.close();
+  expect(bridge.trustedDownloadHosts).toEqual([]);
+});

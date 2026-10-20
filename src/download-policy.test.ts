@@ -90,3 +90,21 @@ it("checks chunk lengths and supports empty files", async () => {
   expect((await readFile(saved)).length).toBe(0);
   expect(MAX_DOWNLOAD_BYTES).toBe(524288000);
 });
+
+it("saves unknown-length IO streams with byte counting and collision safety", async () => {
+  const { saveDownloadStream } = await import("./download-policy.js");
+  const destination = await prepareDownloadDestination({ filename: "stream.bin" }, [allowed]);
+  async function* chunks() { yield Buffer.from([0, 255]); yield Buffer.from("é"); }
+  const first = await saveDownloadStream(destination, chunks());
+  const second = await saveDownloadStream(destination, chunks());
+  expect(first.bytes).toBe(4);
+  expect(await readFile(first.saved)).toEqual(Buffer.from([0, 255, 0xc3, 0xa9]));
+  expect(second.saved).toContain("stream (1).bin");
+});
+it("rejects streamed oversize and removes its partial file before publication", async () => {
+  const { saveDownloadStream } = await import("./download-policy.js");
+  const destination = await prepareDownloadDestination({ filename: "stream.bin" }, [allowed]);
+  async function* chunks() { yield Buffer.from("a"); yield Buffer.allocUnsafe(MAX_DOWNLOAD_BYTES); }
+  await expect(saveDownloadStream(destination, chunks())).rejects.toThrow(/500 MB/);
+  expect(await readdir(allowed)).toEqual([]);
+});
