@@ -162,7 +162,7 @@ async function handleMessage(message) {
       const { blockedDomains } = await settings();
       assertTabNotBlocked(tab, blockedDomains);
       if (message.method === "Page.navigate") assertTabNotBlocked({ url: message.params?.url }, blockedDomains);
-      if (message.requiresWritable) assertWritableTab(tab);
+      if (message.requiresWritable || message.method?.startsWith("Input.") || message.method === "DOM.setFileInputFiles") assertWritableTab(tab);
       if (message.method === "DOM.setFileInputFiles") await assertFileUploadAllowed(message, tab);
       result = await chrome.debugger.sendCommand({ tabId: message.tabId }, message.method, message.params || {});
     }

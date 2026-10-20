@@ -7,7 +7,7 @@ import { AnnotationStore } from "./annotations.js";
 import { AnnotationWebhook } from "./annotation-webhook.js";
 import { isPotentiallyConsequential } from "./policy.js";
 import { PROTOCOL_VERSION, type AnnotationExtensionRequest, type ControlClientMessage, type ControlServerMessage, type SharedTab } from "./protocol.js";
-import { clickDetailsScript, clickScript, describeKey, scrollScript, snapshotScript, typeScript, uploadFileScript } from "./dom-actions.js";
+import { clickDetailsScript, clickTargetScript, clickScript, describeKey, scrollScript, snapshotScript, typeScript, uploadFileScript } from "./dom-actions.js";
 import { TabLeaseManager } from "./tab-lease.js";
 import { assertBrowserUrlAllowed, isReadOnlyBrowserUrl, assertTabNotBlocked, isBlockedBrowserUrl } from "./url-policy.js";
 import { validateUploadFiles } from "./upload-policy.js";
@@ -32,14 +32,23 @@ async function getUnblockedTab(bridge: BrowserBridge, tabId: number, label: stri
 
 async function cdp(bridge: BrowserBridge, tabId: number, label: string | undefined, method: string, params: Record<string, unknown> = {}, requiresWritable = false): Promise<any> {
   if (method === "Page.navigate") assertTabNotBlocked({ url: params.url as string }, bridge.blockedDomains);
-  await getUnblockedTab(bridge, tabId, label);
+  const tab = await getUnblockedTab(bridge, tabId, label);
+  if (requiresWritable) assertTabWritable(tab);
   return bridge.command({ action: "cdp", tabId, label, method, params, requiresWritable });
+}
+
+function assertTabWritable(tab: { url: string; pendingUrl?: string }): void {
+  if (isReadOnlyBrowserUrl(tab.url) || (tab.pendingUrl && isReadOnlyBrowserUrl(tab.pendingUrl))) {
+    throw new Error("Bank, card, payment and password-manager pages are read-only; clicking, typing, key presses and navigation are disabled");
+  }
 }
 
 // Runtime.evaluate reports page-script throws via exceptionDetails instead of
 // failing the CDP call outright, so surface those as real errors.
-async function evaluate(bridge: BrowserBridge, tabId: number, label: string | undefined, expression: string, requiresWritable = false): Promise<unknown> {
-  const result = await cdp(bridge, tabId, label, "Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true }, requiresWritable);
+async function evaluate(bridge: BrowserBridge, tabId: number, label: string | undefined, expression: string, options: { requiresWritable?: boolean; userGesture?: boolean } = {}): Promise<unknown> {
+  const result = await cdp(bridge, tabId, label, "Runtime.evaluate", {
+    expression, returnByValue: true, awaitPromise: true, userGesture: options.userGesture
+  }, options.requiresWritable);
   if (result?.exceptionDetails) {
     throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text ?? "Page script failed");
   }
@@ -243,10 +252,7 @@ export class DaemonServer {
   private async assertWritableTab(tabId: number, label: string | undefined): Promise<void> {
     // Read live Chrome state under the tab lease, including after an approval
     // wait. Cached broadcasts can lag redirects or a user's navigation.
-    const tab = await getUnblockedTab(this.bridge, tabId, label);
-    if (isReadOnlyBrowserUrl(tab.url) || (tab.pendingUrl && isReadOnlyBrowserUrl(tab.pendingUrl))) {
-      throw new Error("Bank, card, payment and password-manager pages are read-only; clicking, typing, key presses and navigation are disabled");
-    }
+    assertTabWritable(await getUnblockedTab(this.bridge, tabId, label));
   }
 
   // Requests human approval, labelled with the requesting adapter's
@@ -361,7 +367,18 @@ export class DaemonServer {
           await this.approve(clientId, tabId, `Allow click: ${actionSummary}`);
           await this.assertWritableTab(tabId, label);
         }
-        return evaluate(this.bridge, tabId, label, clickScript(ref), true);
+        const target = (await evaluate(this.bridge, tabId, label, clickTargetScript(ref), { requiresWritable: true })) as {
+          x: number; y: number; hasSize: boolean; visible: boolean; hitTarget: boolean;
+        };
+        if (target.hasSize && target.visible && target.hitTarget) {
+          const { x, y } = target;
+          await cdp(this.bridge, tabId, label, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y }, true);
+          await cdp(this.bridge, tabId, label, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 }, true);
+          await cdp(this.bridge, tabId, label, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 }, true);
+          return { clicked: true, method: "mouse" };
+        }
+        await evaluate(this.bridge, tabId, label, clickScript(ref), { requiresWritable: true, userGesture: true });
+        return { clicked: true, method: "script" };
       });
     }
 
@@ -369,7 +386,7 @@ export class DaemonServer {
       return this.leases.runExclusive(tabId, async () => {
         await this.assertWritableTab(tabId, label);
         this.assertGenerationCurrent(tabId, message.snapshotId);
-        return evaluate(this.bridge, tabId, label, typeScript(message.ref ?? "", message.text ?? ""), true);
+        return evaluate(this.bridge, tabId, label, typeScript(message.ref ?? "", message.text ?? ""), { requiresWritable: true, userGesture: true });
       });
     }
 

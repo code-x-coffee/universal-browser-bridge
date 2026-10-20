@@ -98,7 +98,7 @@ export async function runMcpServer(bridge: DaemonClient, transport: Transport = 
 
   server.tool(
     "browser_click",
-    "Click an element from browser_snapshot. Requires the snapshotId from that snapshot; stale snapshots (e.g. after navigation) are rejected. Consequential actions require explicit user confirmation; the daemon decides and enforces this, not the calling adapter.",
+    "Scroll an element from browser_snapshot into view and click its center with trusted mouse input when visible and hit-testable. Otherwise use a script click with user activation. Returns { clicked: true, method: 'mouse' | 'script' }. Requires the snapshotId from that snapshot; stale snapshots (e.g. after navigation) are rejected. Consequential actions require explicit user confirmation; the daemon decides and enforces this, not the calling adapter.",
     {
       ref: z.string().regex(/^ubb-\d+$/),
       description: z.string().min(1),
@@ -111,7 +111,7 @@ export async function runMcpServer(bridge: DaemonClient, transport: Transport = 
 
   server.tool(
     "browser_type",
-    "Replace the contents of a shared-page input using a ref and snapshotId from browser_snapshot.",
+    "Replace the contents of a shared-page input using a ref and snapshotId from browser_snapshot. The focus/value script runs with user activation.",
     { ref: z.string().regex(/^ubb-\d+$/), text: z.string(), snapshotId: z.string().min(1), tabId: z.number().int().optional() },
     async ({ ref, text: input, snapshotId, tabId }) =>
       text(await bridge.request({ action: "type", tabId: await selectedTab(bridge, tabId), ref, text: input, snapshotId }))
@@ -133,7 +133,7 @@ export async function runMcpServer(bridge: DaemonClient, transport: Transport = 
 
   server.tool(
     "browser_press",
-    "Press a keyboard key in a shared tab. Enter can submit forms, so it requires explicit user confirmation; the daemon decides and enforces this, not the calling adapter.",
+    "Press a keyboard key in a shared tab using trusted CDP keyboard input. Enter and NumpadEnter can submit forms, so they require explicit user confirmation; the daemon decides and enforces this, not the calling adapter.",
     {
       key: z.string().min(1).max(30),
       tabId: z.number().int().optional()
