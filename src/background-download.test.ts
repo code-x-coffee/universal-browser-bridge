@@ -36,7 +36,7 @@ const download = (extra = {}) => command({ action: "downloadStart", tabId, label
 beforeEach(async () => {
   vi.resetModules(); vi.useFakeTimers();
   mock = createChromeMock(); vi.stubGlobal("chrome", mock.chrome); vi.stubGlobal("WebSocket", FakeSocket);
-  await mock.chrome.storage.local.set({ token: "test-token", trustedDownloadHosts: [" CDN.Example. "], downloadFolders: ["/tmp/"] });
+  await mock.chrome.storage.local.set({ token: "test-token", trustedDownloadHosts: [" CDN.Example. ", "*.googlevideo.com"], downloadFolders: ["/tmp/"] });
   // @ts-expect-error Plain extension script imported for side effects.
   await import("../extension/background.js"); await settle();
   tabId = (await command({ action: "createTab", label: "Agent", url: "https://flow.google.com/" })).result.id;
@@ -60,8 +60,10 @@ afterEach(async () => {
   await cancelNetworkDownloads(undefined, true); vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks();
 });
 it("sends normalized trusted hosts in hello, sitePolicy and immediately on storage changes", async () => {
-  expect(FakeSocket.instance.messages.find(m => m.type === "hello")).toMatchObject({ trustedDownloadHosts: ["cdn.example"] });
-  expect(FakeSocket.instance.messages.find(m => m.type === "sitePolicy")).toMatchObject({ trustedDownloadHosts: ["cdn.example"] });
+  expect(FakeSocket.instance.messages.find(m => m.type === "hello")).toMatchObject({ trustedDownloadHosts: ["cdn.example", "*.googlevideo.com"] });
+  expect(FakeSocket.instance.messages.find(m => m.type === "sitePolicy")).toMatchObject({ trustedDownloadHosts: ["cdn.example", "*.googlevideo.com"] });
+  await mock.chrome.storage.local.set({ trustedDownloadHosts: ["*.googlevideo.com"] }); await settle();
+  expect(FakeSocket.instance.messages.filter(m => m.type === "sitePolicy").at(-1)).toMatchObject({ trustedDownloadHosts: ["*.googlevideo.com"] });
   await mock.chrome.storage.local.set({ trustedDownloadHosts: [] }); await settle();
   expect(FakeSocket.instance.messages.filter(m => m.type === "sitePolicy").at(-1)).toMatchObject({ trustedDownloadHosts: [] });
 });

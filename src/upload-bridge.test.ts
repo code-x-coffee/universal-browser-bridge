@@ -68,14 +68,14 @@ it("syncs download folders separately from uploads and fails closed on missing o
   expect(bridge.downloadFolders).toEqual([]);
 });
 
-it("syncs exact trusted download hosts through hello/sitePolicy, failing closed and ignoring replaced peers", () => {
+it("syncs exact and wildcard trusted download hosts through hello/sitePolicy, failing closed and ignoring replaced peers", () => {
   const old = connect({ trustedDownloadHosts: ["OLD.example.", "*.example"] });
   expect(bridge.trustedDownloadHosts).toEqual(["old.example"]);
-  const current = connect({ trustedDownloadHosts: [" CDN.Example. ", "cdn.example", "https://invalid"] });
+  const current = connect({ trustedDownloadHosts: [" CDN.Example. ", "cdn.example", "*.googlevideo.com", "https://invalid"] });
   old.push({ type: "sitePolicy", blockedDomains: [], trustedDownloadHosts: ["attack.example"] });
-  expect(bridge.trustedDownloadHosts).toEqual(["cdn.example"]);
-  current.push({ type: "sitePolicy", blockedDomains: [], trustedDownloadHosts: ["new.example"] });
-  expect(bridge.trustedDownloadHosts).toEqual(["new.example"]);
+  expect(bridge.trustedDownloadHosts).toEqual(["cdn.example", "*.googlevideo.com"]);
+  current.push({ type: "sitePolicy", blockedDomains: [], trustedDownloadHosts: ["new.example", "*.googlevideo.com"] });
+  expect(bridge.trustedDownloadHosts).toEqual(["new.example", "*.googlevideo.com"]);
   current.push({ type: "sitePolicy", blockedDomains: [] });
   expect(bridge.trustedDownloadHosts).toEqual([]);
   current.push({ type: "sitePolicy", blockedDomains: [], trustedDownloadHosts: "bad" });

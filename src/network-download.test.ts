@@ -86,6 +86,25 @@ it("holds a same-origin to trusted redirect for daemon validation before continu
   expect(await advance()).toMatchObject({ mimeType: "application/octet-stream" });
   expect(next).toBe(2);
 });
+it("holds a same-origin redirect to a wildcard subdomain until the daemon continues", async () => {
+  hosts = ["*.googlevideo.com"];
+  const target = "https://rr4---sn-h5576n7k.googlevideo.com/media?token=secret";
+  responses = [redirect("https://flow.google.com/clip?token=secret", target), final(target)];
+  expect(await start()).toEqual({ redirectUrl: target });
+  expect(next).toBe(1);
+  expect(send.mock.calls.some((call: any) => call[1] === "Fetch.continueRequest")).toBe(false);
+  expect(await advance()).toMatchObject({ mimeType: "application/octet-stream" });
+  expect(await read()).toMatchObject({ data: "AAEC/w==", eof: true });
+  await close(); cleaned();
+});
+it("refuses a wildcard lookalike redirect before continuation with hostname-only guidance", async () => {
+  hosts = ["*.googlevideo.com"];
+  responses = [redirect("https://flow.google.com/clip?token=secret", "https://googlevideo.com.evil.net/private?token=secret#fragment")];
+  await expect(start()).rejects.toThrow('Download host googlevideo.com.evil.net is not a trusted download host; add it under "Trusted download hosts" in Extension options');
+  expect(next).toBe(1);
+  expect(send.mock.calls.some((call: any) => call[1] === "Fetch.continueRequest")).toBe(false);
+  cleaned();
+});
 it.each([
   ["https://evil.example/private?token=secret", /evil.example is not a trusted download host/],
   ["http://cdn.example/private?token=secret", /cdn.example uses plain http/]

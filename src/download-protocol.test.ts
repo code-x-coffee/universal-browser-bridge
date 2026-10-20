@@ -205,6 +205,36 @@ it("falls back from same-origin opaqueredirect and independently checks a truste
   expect(pageFetches).toHaveLength(1);
   expect(pageEntriesAtNetworkStart).toEqual([[]]);
 });
+it("accepts a same-origin redirect to a wildcard subdomain through interception fallback", async () => {
+  pageResponseType = "opaqueredirect";
+  push({ type: "sitePolicy", blockedDomains: [], downloadFolders: [directory], trustedDownloadHosts: ["*.googlevideo.com"] });
+  networkUrls = ["https://rr4---sn-h5576n7k.googlevideo.com/media?token=secret"];
+  const result = await download({ url: "https://app.example/media" });
+  expect(result.error).toBeUndefined();
+  expect(await readFile(result.result.saved)).toEqual(bytes);
+  expect(commands.filter(command => command.action === "downloadContinue")).toHaveLength(1);
+  expect(pageFetches).toHaveLength(1);
+  expect(pageEntriesAtNetworkStart).toEqual([[]]);
+});
+it("refuses a wildcard lookalike redirect independently before continuation without leaking URL details", async () => {
+  pageResponseType = "opaqueredirect";
+  push({ type: "sitePolicy", blockedDomains: [], downloadFolders: [directory], trustedDownloadHosts: ["*.googlevideo.com"] });
+  networkUrls = ["https://googlevideo.com.evil.net/private?token=secret#fragment"];
+  const result = await download({ url: "https://app.example/media" });
+  expect(result.error).toBe('Download host googlevideo.com.evil.net is not a trusted download host; add it under "Trusted download hosts" in Extension options');
+  expect(commands.some(command => command.action === "downloadContinue")).toBe(false);
+  expect(commands.some(command => command.action === "downloadCancel")).toBe(true);
+  expect(await readdir(directory)).toEqual([]);
+});
+it("routes an initial cross-origin wildcard host directly through interception", async () => {
+  push({ type: "sitePolicy", blockedDomains: [], downloadFolders: [directory], trustedDownloadHosts: ["*.googlevideo.com"] });
+  const url = "https://rr4---sn-h5576n7k.googlevideo.com/media?token=secret";
+  const result = await download({ url });
+  expect(result.error).toBeUndefined();
+  expect(await readFile(result.result.saved)).toEqual(bytes);
+  expect(pageFetches).toEqual([]);
+  expect(commands.find(command => command.action === "downloadStart")).toMatchObject({ url });
+});
 it.each(["https://untrusted.example/private?token=secret", "http://cdn.example/private?token=secret", "https://blocked.example/private?token=secret"])(
   "refuses fallback redirect %s without continuation or token leakage", async url => {
     pageResponseType = "opaqueredirect";

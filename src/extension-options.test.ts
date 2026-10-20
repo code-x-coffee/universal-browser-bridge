@@ -121,14 +121,26 @@ it("saves normalized download folders separately and reports ignored entries", a
   expect(await mock.chrome.storage.local.get("downloadFolders")).toEqual({ downloadFolders: [] });
 });
 
-it("loads trusted hosts with an empty default and saves normalized hosts with ignored counts", async () => {
+it("saves normalized exact and wildcard hosts and reports specific ignored-line reasons", async () => {
   await load();
   expect(field("trustedDownloadHosts")?.value).toBe("");
-  field("trustedDownloadHosts").value = " CDN.Example.\ncdn.example\nhttps://bad.example/path\n*.example.com\n127.0.0.1\n\n";
+  field("trustedDownloadHosts").value = " CDN.Example.\ncdn.example\n*.com\n*.example.com\n127.0.0.1\n\n";
   await field("savePolicy").events.get("click")!();
-  expect(await mock.chrome.storage.local.get("trustedDownloadHosts")).toEqual({ trustedDownloadHosts: ["cdn.example"] });
-  expect(field("trustedDownloadHosts").value).toBe("cdn.example");
-  expect(field("policyStatus").textContent).toContain("Ignored 3 invalid trusted download host entries");
+  expect(await mock.chrome.storage.local.get("trustedDownloadHosts")).toEqual({ trustedDownloadHosts: ["cdn.example", "*.example.com"] });
+  expect(field("trustedDownloadHosts").value).toBe("cdn.example\n*.example.com");
+  expect(field("policyStatus").textContent).toContain('Ignored "*.com": wildcard needs at least two labels after "*."');
+  expect(field("policyStatus").textContent).toContain('Ignored "127.0.0.1": IP literals are not allowed');
+});
+it("keeps ignored-host reasons concise for many or very long lines", async () => {
+  await load();
+  field("trustedDownloadHosts").value = ["*.com", "a.*.com", "a".repeat(300), "*", "*.google"].join("\n");
+  await field("savePolicy").events.get("click")!();
+  const status = field("policyStatus").textContent;
+  expect(status).toContain('Ignored "*.com": wildcard needs at least two labels after "*."');
+  expect(status).toContain('Ignored "a.*.com": wildcard must be a single leading "*." label');
+  expect(status).toContain("hostname must be at most 253 characters");
+  expect(status).toContain("2 more invalid trusted download host entries");
+  expect(status.length).toBeLessThan(550);
 });
 it("loads existing trusted hosts and can disable them", async () => {
   await load({ trustedDownloadHosts: [" CDN.Example. ", "cdn.example"] });
