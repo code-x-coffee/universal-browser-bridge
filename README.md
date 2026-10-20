@@ -203,7 +203,9 @@ ubb --label Hephaestus browser_close_tab '{"tabId":123}'
 
 `browser_list_agent_tabs` returns `{tabId, url, title, groupId}` for each tab owned by the caller's label. `browser_status` and `browser_tabs` include hand-shared tabs and the caller's owned tabs. Every browser tool accepts owned tab IDs. Other labels, including clients without a label, cannot list, read, drive or close those tabs. A label is a caller-supplied identity: authenticated clients presenting the same label share ownership, even across separate CLI invocations or MCP sessions.
 
-Ownership is stored in [`chrome.storage.session`](https://developer.chrome.com/docs/extensions/reference/api/storage#property-session). It survives extension service-worker restarts and daemon/client reconnects within the Chrome session. Restarting Chrome, reloading/updating the extension, or disabling it clears session storage. Restoration reconciles closed tabs and tabs that have left their original group. Closing, ungrouping, moving a tab to another group, renaming its group, clicking the toolbar to unshare, or cancelling debugging revokes ownership. Merely placing an existing tab in a named group never grants an agent access to it.
+Current tab access is stored in `chrome.storage.session`; labelled ownership is also stored in `chrome.storage.local` under `agentTabOwnersDurable`. It survives service-worker restarts, extension reloads/updates, and daemon/client reconnects when the recorded tab, exact label/group title and agent window still validate. The group title is the literal label, including spaces and pattern characters; unlabelled tabs use **Agent Bridge**. Restoration never derives a label from a group or adopts other tabs in that group. Missing tabs, invalid mappings, duplicate records and ambiguous windows are dropped. The agent window is restored only from validated owned tabs. Hand-shared and unlabelled access remains session-only.
+
+Closing, ungrouping, moving a tab to another group/window, renaming its group, clicking the toolbar to unshare, or cancelling debugging revokes ownership and removes its durable record. Durable revocation also prevents stale session data from restoring access. Merely placing an existing tab in a named group never grants an agent access to it.
 
 Without a label, `browser_new_tab` keeps the existing behavior: it creates a shared, unowned tab in **Agent Bridge**. All clients may read and drive it. While its creating client remains connected, only that client may close it; after disconnect it may be closed by another client. `browser_list_agent_tabs` requires a label. `browser_close_tab` also accepts hand-shared tabs legitimately controlled by the caller. Hand sharing still uses **Agent Bridge** and the **ON** badge.
 
@@ -370,8 +372,8 @@ Both commands use the authenticated daemon control socket, so **serve** must be 
 | --- | --- |
 | `browser_status` | Show extension connection state, shared tabs and caller-owned tabs |
 | `browser_tabs` | List shared tabs and caller-owned tabs |
-| `browser_new_tab` | Open a tab in the agent window, owned and grouped under the caller's label when supplied |
-| `browser_list_agent_tabs` | List the caller label's tabs as tabId, url, title and groupId |
+| `browser_new_tab` | Open a tab in the agent window; labelled ownership survives reloads when its exact group and window still validate |
+| `browser_list_agent_tabs` | List the caller label's current or validated restored tabs as tabId, url, title and groupId |
 | `browser_close_tab` | Close a caller-owned tab or a tab otherwise legitimately shared with the caller |
 | `browser_snapshot` | Read compact interactive elements and receive a `snapshotId` |
 | `browser_navigate` | Navigate a shared tab to an allowed URL |
@@ -531,6 +533,22 @@ curl http://127.0.0.1:17321/health
 
 A successful pairing reports `"connected": true`.
 
+The extension sends its existing 20-second ping while connected. A `ubb-keepalive` Chrome alarm runs every 30 seconds and reconnects when the socket is closed or unauthenticated, including after the service worker has stopped during a longer daemon outage. This version adds the **alarms** permission; reload the extension to apply the manifest change.
+
+### Daemon logs and detach diagnostics
+
+`serve` writes logs to stderr, shown in its terminal or captured by your process supervisor. There is no built-in log file. To capture one yourself:
+
+```bash
+npm run serve 2>>/tmp/ubb-daemon.log
+```
+
+Every daemon log line, including startup, shutdown, webhook errors and diagnostics, has a local ISO timestamp with its UTC offset, for example `[2026-10-20T12:34:56.123+05:30]`. MCP stdout and CLI JSON output retain their existing format.
+
+The log records extension connection/disconnection, restored tab ownership, and structured extension diagnostics with `event`, `tabId`, `reason`, optional `label`, and the event's `at` timestamp. Detach diagnostics use `event: "debuggerDetached"` and preserve Chrome's reason. Up to 50 diagnostics are queued in the worker while disconnected and flushed on reconnection.
+
+`canceled_by_user` immediately revokes access, removes durable ownership and cancels recovery. For other reasons such as `target_closed`, a labelled tab that still exists in its exact owner group and window gets one re-attach attempt after about 500 ms. Attempts are limited to three per tab per minute. Commands are refused while recovery is pending. Failed validation, attachment failure or the rate limit drops ownership and is logged; a real closed tab cannot be recovered. Successful recovery logs `debuggerReattached`. Hand-shared tabs retain the existing revocation behavior.
+
 ### Toolbar badge meanings
 
 | Badge | Meaning |
@@ -568,10 +586,11 @@ npm run serve
 
 ### Shared tab disappears
 
-- Confirm the tab remains in the **Agent Bridge** group.
+- Confirm the tab remains in its exact label group, or **Agent Bridge** for a hand-shared tab.
 - Renaming the group or dragging the tab out revokes access by design.
 - Clicking the extension icon toggles sharing.
 - Chrome may refuse debugger attachment while DevTools is attached to the same target.
+- Inspect the daemon's `debuggerDetached`, `ownershipDropped` and `debuggerReattachFailed` diagnostics for the reason.
 
 ### New unpacked folder lost its settings
 
@@ -581,6 +600,7 @@ Chrome assigns unpacked extensions an identity based partly on their loaded dire
 
 - TypeScript/daemon change: run `npm run build`, then restart `serve` and MCP adapters.
 - Extension JavaScript change: click **Reload** in `chrome://extensions`.
+- Manifest change, including the new **alarms** permission: reload the extension. Labelled tabs restore only after their stored group and window pass validation.
 - MCP client configuration change: restart the MCP client or start a new agent session.
 
 ## Security boundaries
@@ -602,6 +622,7 @@ Chrome assigns unpacked extensions an identity based partly on their loaded dire
 - Blocklisted domains and their subdomains refuse all page operations in owned and hand-shared tabs, with current and pending URL checks in both the daemon and extension.
 - The model cannot approve its own request.
 - Agent-created tabs belong to their creating adapter while it is connected.
+- Durable labelled ownership requires a stored record and an exact label/group/window match. Group titles alone never grant ownership. Explicit debugging cancellation and revoked durable records cannot trigger automatic re-attachment or restoration.
 - Per-tab queues prevent concurrent agents from interleaving actions.
 - Snapshot generations prevent old references from acting after navigation.
 - Dragging a tab out of the **Agent Bridge** group revokes access.
