@@ -15,6 +15,7 @@ import { validateUploadFiles } from "./upload-policy.js";
 type ControlRequest = Extract<ControlClientMessage, { type: "request" }>;
 
 type ClientInfo = { socket: Socket; label?: string; connected: boolean };
+type ClickTarget = { x: number; y: number; hasSize: boolean; visible: boolean; hitTarget: boolean };
 
 // Sentinel lease key: serializes createTab calls (which have no tabId yet)
 // so adapters cannot race the agent-window creation/optional approval flow.
@@ -266,6 +267,19 @@ export class DaemonServer {
     if (!result?.approved) throw new Error(`User denied browser action: ${description}`);
   }
 
+  private async approveClickIfNeeded(clientId: string, tabId: number, message: ControlRequest): Promise<void> {
+    const label = this.clients.get(clientId)?.label;
+    const details = (await evaluate(this.bridge, tabId, label, clickDetailsScript(message.ref ?? ""))) as {
+      text?: string; type?: string; href?: string; formAction?: string;
+    };
+    const actionSummary = [message.description, details.text, details.type, details.href, details.formAction]
+      .filter(Boolean).join(" | ");
+    if (isPotentiallyConsequential(actionSummary)) {
+      await this.approve(clientId, tabId, `Allow click: ${actionSummary}`);
+      await this.assertWritableTab(tabId, label);
+    }
+  }
+
   private async dispatch(message: ControlRequest, clientId: string): Promise<unknown> {
     const { action, tabId } = message;
     const client = this.clients.get(clientId);
@@ -354,22 +368,8 @@ export class DaemonServer {
         await this.assertWritableTab(tabId, label);
         this.assertGenerationCurrent(tabId, message.snapshotId);
         const ref = message.ref ?? "";
-        const details = (await evaluate(this.bridge, tabId, label, clickDetailsScript(ref))) as {
-          text?: string;
-          type?: string;
-          href?: string;
-          formAction?: string;
-        };
-        const actionSummary = [message.description, details.text, details.type, details.href, details.formAction]
-          .filter(Boolean)
-          .join(" | ");
-        if (isPotentiallyConsequential(actionSummary)) {
-          await this.approve(clientId, tabId, `Allow click: ${actionSummary}`);
-          await this.assertWritableTab(tabId, label);
-        }
-        const target = (await evaluate(this.bridge, tabId, label, clickTargetScript(ref), { requiresWritable: true })) as {
-          x: number; y: number; hasSize: boolean; visible: boolean; hitTarget: boolean;
-        };
+        await this.approveClickIfNeeded(clientId, tabId, message);
+        const target = (await evaluate(this.bridge, tabId, label, clickTargetScript(ref), { requiresWritable: true })) as ClickTarget;
         if (target.hasSize && target.visible && target.hitTarget) {
           const { x, y } = target;
           await cdp(this.bridge, tabId, label, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y }, true);
@@ -392,6 +392,8 @@ export class DaemonServer {
 
     if (action === "uploadFile") {
       return this.leases.runExclusive(tabId, async () => {
+        const mode = message.mode ?? "auto";
+        if (!["auto", "input", "chooser"].includes(mode)) throw new Error("Upload mode must be auto, input or chooser");
         if (typeof label !== "string" || !label.trim()) throw new Error("An agent label is required for file uploads");
         const ownedTabs = await this.bridge.command({ action: "listAgentTabs", label });
         if (!Array.isArray(ownedTabs) || !ownedTabs.some((tab) => tab.tabId === tabId)) {
@@ -400,23 +402,33 @@ export class DaemonServer {
         await this.assertWritableTab(tabId, label);
         this.assertGenerationCurrent(tabId, message.snapshotId);
         const realPaths = await validateUploadFiles(message.files, this.bridge.uploadFolders);
-        const target = await cdp(this.bridge, tabId, label, "Runtime.evaluate", {
-          expression: uploadFileScript(message.ref ?? "", realPaths.length), returnByValue: false
-        }, true);
-        if (target?.exceptionDetails) {
-          throw new Error(target.exceptionDetails.exception?.description ?? target.exceptionDetails.text ?? "Page script failed");
-        }
-        const objectId = target?.result?.objectId;
-        if (typeof objectId !== "string" || !objectId) throw new Error("Chrome did not return a file input objectId");
-        try {
-          await cdp(this.bridge, tabId, label, "DOM.setFileInputFiles", { files: realPaths, objectId }, true);
-        } catch (error) {
-          if (/not allowed/i.test((error as Error).message)) {
-            throw new Error(`${(error as Error).message}. Enable "Allow access to file URLs" for Universal Browser Bridge in chrome://extensions`);
+        if (mode !== "chooser") {
+          const target = await cdp(this.bridge, tabId, label, "Runtime.evaluate", {
+            expression: uploadFileScript(message.ref ?? "", realPaths.length, mode === "auto"), returnByValue: false
+          }, true);
+          if (target?.exceptionDetails) {
+            throw new Error(target.exceptionDetails.exception?.description ?? target.exceptionDetails.text ?? "Page script failed");
           }
-          throw error;
+          if (target?.result?.subtype !== "null") {
+            const objectId = target?.result?.objectId;
+            if (typeof objectId !== "string" || !objectId) throw new Error("Chrome did not return a file input objectId");
+            try {
+              await cdp(this.bridge, tabId, label, "DOM.setFileInputFiles", { files: realPaths, objectId }, true);
+            } catch (error) {
+              if (/not allowed/i.test((error as Error).message)) {
+                throw new Error(`${(error as Error).message}. Enable "Allow access to file URLs" for Universal Browser Bridge in chrome://extensions`);
+              }
+              throw error;
+            }
+            return { uploaded: realPaths.length, files: realPaths, method: "input", picker: "input" };
+          }
         }
-        return { uploaded: realPaths.length, files: realPaths };
+        await this.approveClickIfNeeded(clientId, tabId, message);
+        const target = (await evaluate(this.bridge, tabId, label, clickTargetScript(message.ref ?? ""), { requiresWritable: true })) as ClickTarget;
+        await this.assertWritableTab(tabId, label);
+        this.assertGenerationCurrent(tabId, message.snapshotId);
+        return this.bridge.command({ action: "uploadViaFileChooser", tabId, label, files: realPaths, timeoutMs: 5000,
+          ...(target.hasSize && target.visible && target.hitTarget ? { x: target.x, y: target.y } : { ref: message.ref }) });
       });
     }
 

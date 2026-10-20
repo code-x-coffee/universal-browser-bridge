@@ -119,16 +119,17 @@ export async function runMcpServer(bridge: DaemonClient, transport: Transport = 
 
   server.tool(
     "browser_upload_file",
-    "Attach local files to a file input in a tab owned by your agent label. The target can be an <input type=file> or a label/button wrapping one. Files must be inside a folder the user allowed in Extension options. Never available in hand-shared tabs, blocklisted sites, or bank/card/payment/password-manager pages. Requires the ref and snapshotId from browser_snapshot.",
+    "Attach local files in a tab owned by your agent label. Mode auto (default) uses a file input or associated label/descendant when available, otherwise clicks the ref and intercepts its file chooser. Mode input requires a file input; mode chooser always clicks. Chooser mode waits up to 5 s and temporarily shims showOpenFilePicker with file-handle-like objects, which may fail instanceof FileSystemFileHandle checks. Returns uploaded, files, method (input/chooser) and picker (input/showOpenFilePicker). Files must be inside a folder the user allowed in Extension options. Never available in hand-shared tabs, blocklisted sites, or bank/card/payment/password-manager pages. Requires description and the ref and snapshotId from browser_snapshot; consequential chooser clicks require approval.",
     {
       ref: z.string().regex(/^ubb-\d+$/),
       description: z.string().min(1),
       snapshotId: z.string().min(1),
       files: z.array(z.string()).min(1).max(10),
+      mode: z.enum(["auto", "input", "chooser"]).optional(),
       tabId: z.number().int().optional()
     },
-    async ({ ref, description, snapshotId, files, tabId }) =>
-      text(await bridge.request({ action: "uploadFile", tabId: await selectedTab(bridge, tabId), ref, description, snapshotId, files }))
+    async ({ ref, description, snapshotId, files, mode, tabId }) =>
+      text(await bridge.request({ action: "uploadFile", tabId: await selectedTab(bridge, tabId), ref, description, snapshotId, files, ...(mode === undefined ? {} : { mode }) }))
   );
 
   server.tool(

@@ -1,5 +1,6 @@
 import { isReadOnlyBrowserUrl, normalizeBlockedDomains, isBlockedBrowserUrl, assertTabNotBlocked } from "./url-policy.js";
 import { DEFAULT_UPLOAD_FOLDERS, normalizeUploadFolders } from "./upload-policy.js";
+import { uploadViaFileChooser } from "./file-chooser.js";
 
 const PROTOCOL_VERSION = 1;
 const DEFAULT_URL = "ws://127.0.0.1:17321/extension";
@@ -166,6 +167,12 @@ async function handleMessage(message) {
       if (message.method === "DOM.setFileInputFiles") await assertFileUploadAllowed(message, tab);
       result = await chrome.debugger.sendCommand({ tabId: message.tabId }, message.method, message.params || {});
     }
+    if (message.action === "uploadViaFileChooser") {
+      result = await uploadViaFileChooser(message, async () => {
+        const tab = await assertControlledTab(message.tabId, message.label);
+        await assertFileUploadAllowed(message, tab);
+      });
+    }
     send({ type: "response", id: message.id, result });
   } catch (error) {
     send({ type: "response", id: message.id, error: error?.message || String(error) });
@@ -194,7 +201,7 @@ async function assertFileUploadAllowed(message, tab) {
   if (!uploadFolders.length) {
     throw new Error("File uploads are disabled: no allowed upload folders are configured in Extension options");
   }
-  const files = message.params?.files;
+  const files = message.action === "uploadViaFileChooser" ? message.files : message.params?.files;
   if (!Array.isArray(files) || files.length < 1 || files.length > 10) throw new Error("File uploads require 1..10 files");
   for (const file of files) {
     if (typeof file !== "string" || !file.startsWith("/") || file.includes("\0") || file.split("/").includes("..")

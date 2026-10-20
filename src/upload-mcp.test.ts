@@ -25,8 +25,14 @@ it("advertises the upload schema without a tool for changing allowed folders", a
   expect(tool.inputSchema.required).not.toContain("tabId");
   expect(tool.inputSchema.properties).toMatchObject({
     ref: { type: "string", pattern: "^ubb-\\d+$" }, description: { minLength: 1 }, snapshotId: { minLength: 1 },
-    files: { type: "array", minItems: 1, maxItems: 10, items: { type: "string" } }, tabId: { type: "integer" }
+    files: { type: "array", minItems: 1, maxItems: 10, items: { type: "string" } }, tabId: { type: "integer" },
+    mode: { enum: ["auto", "input", "chooser"] }
   });
+});
+
+it.each(["auto", "input", "chooser"])("forwards upload mode %s", async (mode) => {
+  expect((await client.callTool({ name: "browser_upload_file", arguments: { ...args, mode } })).isError).not.toBe(true);
+  expect(request).toHaveBeenLastCalledWith({ action: "uploadFile", tabId: 7, ...args, mode });
 });
 
 it("sends the upload action using the selected or explicitly requested tab", async () => {
@@ -37,7 +43,7 @@ it("sends the upload action using the selected or explicitly requested tab", asy
   expect(status).toHaveBeenCalledTimes(1);
 });
 
-it.each([{ ref: "bad" }, { description: "" }, { snapshotId: "" }, { files: [] }, { files: Array(11).fill("/x") }, { files: [42] }])(
+it.each([{ ref: "bad" }, { description: "" }, { snapshotId: "" }, { files: [] }, { files: Array(11).fill("/x") }, { files: [42] }, { mode: "unknown" }])(
   "rejects invalid upload arguments %j without dispatch", async (invalid) => {
     expect((await client.callTool({ name: "browser_upload_file", arguments: { ...args, ...invalid } })).isError).toBe(true);
     expect(request).not.toHaveBeenCalled();

@@ -28,6 +28,14 @@ it("rejects disabled inputs including disabled fieldsets and excess files", () =
   expect(() => resolve(input({ matches: () => true }))).toThrow(/disabled/);
   expect(() => resolve(input(), 2)).toThrow(/multiple/);
 });
+it("returns null only for non-input targets when chooser fallback is allowed", () => {
+  const resolveAuto = (el: unknown) => runInNewContext(uploadFileScript("ubb-3", 1, true), {
+    document: { querySelector: () => el }
+  });
+  expect(resolveAuto({ tagName: "BUTTON", matches: () => false, querySelectorAll: () => [] })).toBeNull();
+  expect(() => resolveAuto(null)).toThrow("Element ref expired");
+  expect(() => resolveAuto(input({ disabled: true }))).toThrow(/disabled/);
+});
 it("makes visible labels available in snapshots for hidden file inputs", () => {
   expect(snapshotScript).toContain("a,button,input,label,textarea");
 });

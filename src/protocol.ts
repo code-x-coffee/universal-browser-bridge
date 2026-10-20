@@ -32,7 +32,7 @@ export type AnnotationExtensionMessage =
 export type BridgeCommand = {
   type: "command";
   id: string;
-  action: "listTabs" | "listAgentTabs" | "getTab" | "createTab" | "closeTab" | "requestApproval" | "cdp";
+  action: "listTabs" | "listAgentTabs" | "getTab" | "createTab" | "closeTab" | "requestApproval" | "cdp" | "uploadViaFileChooser";
   label?: string;
   tabId?: number;
   method?: string;
@@ -40,6 +40,11 @@ export type BridgeCommand = {
   requiresWritable?: boolean;
   url?: string;
   description?: string;
+  files?: string[];
+  x?: number;
+  y?: number;
+  ref?: string;
+  timeoutMs?: number;
 };
 
 export type BridgeStatus = {
@@ -90,6 +95,7 @@ export type ControlClientMessage =
       ref?: string;
       text?: string;
       files?: string[];
+      mode?: "auto" | "input" | "chooser";
       snapshotId?: string;
       key?: string;
       deltaY?: number;
