@@ -225,7 +225,11 @@ Blocked pages are hidden from tab listings and refuse new tabs, navigation to th
 
 ### Uploading files
 
-Use `browser_upload_file` to attach local files to an `<input type="file">`, a label associated with one, or a button/container with exactly one file input. Pass `ref`, `description`, `snapshotId` and `files` (an array of absolute file paths). `tabId` is optional and otherwise uses the selected tab. Take a fresh `browser_snapshot` after navigation.
+Use `browser_upload_file` to attach local files through an existing file input or an upload button that opens a file chooser. Pass `ref`, `description`, `snapshotId` and `files` (an array of absolute file paths). `tabId` is optional and otherwise uses the selected tab. Take a fresh `browser_snapshot` after navigation. Optional `mode` controls how the files are attached:
+
+- `auto` (default): use an `<input type="file">`, an associated label, or a container with exactly one file input when available; otherwise click the ref and intercept the chooser.
+- `input`: require a resolvable file input and retain the "Target is not a file input" error for other elements.
+- `chooser`: always click the ref and intercept the chooser, including dynamically created inputs.
 
 ```json
 {
@@ -233,6 +237,7 @@ Use `browser_upload_file` to attach local files to an `<input type="file">`, a l
   "description": "Attach the reference image",
   "snapshotId": "7:0",
   "files": ["/Volumes/NVme/Projects/Stories/reference.png"],
+  "mode": "auto",
   "tabId": 7
 }
 ```
@@ -241,7 +246,11 @@ In Extension options, set **Allowed upload folders**, one absolute folder per li
 
 Uploads require a labelled agent and a tab owned by that same label. Hand-shared tabs, blocklisted sites, and bank/card/payment/password-manager pages cannot receive files. Disabled file inputs are rejected; attaching multiple files requires the input's `multiple` attribute. Each call accepts 1–10 regular files, each at most 100 MB (104,857,600 bytes).
 
-The daemon resolves files and allowed folders with `realpath` and checks containment, so sibling prefixes and symlinks escaping an allowed folder are rejected. Symlinks pointing into an allowed folder resolve to the real file path, which is passed to Chrome and returned as `{ "uploaded": 1, "files": ["/absolute/real/path"] }`. The extension independently checks these real paths against its configured folder prefixes; when configuring a symlinked folder, also allow its real destination. Paths containing NUL or `..` segments are refused.
+The daemon resolves files and allowed folders with `realpath` and checks containment, so sibling prefixes and symlinks escaping an allowed folder are rejected. Symlinks pointing into an allowed folder resolve to the real file path, which is passed to Chrome and returned as `{ "uploaded": 1, "files": ["/absolute/real/path"], "method": "input", "picker": "input" }`. `method` is `input` or `chooser`; `picker` is `input` or `showOpenFilePicker`. The extension independently checks these real paths against its configured folder prefixes; when configuring a symlinked folder, also allow its real destination. Paths containing NUL or `..` segments are refused.
+
+Chooser mode uses the same scroll-to-center, hit-test and trusted mouse input as `browser_click`, with a user-activated script fallback for covered, zero-size or offscreen targets. Consequential clicks retain approval. The extension handles interception and attachment in one command, listens only for the target tab's chooser, and rejects multiple files if it opens in single-selection mode. If no chooser opens within 5 seconds, the error reports whether the `showOpenFilePicker` shim was triggered, with a file-scheme permission hint when that permission is off.
+
+During a chooser call, `window.showOpenFilePicker` is temporarily replaced with a hidden file input that respects `multiple` and the file types in `accept`. Its promise resolves after the input's change event to file-handle-like objects with `kind`, `name`, `getFile`, permission methods and `isSameEntry`. These are not native `FileSystemFileHandle` instances; pages checking `instanceof FileSystemFileHandle` may fail. The extension always attempts to disable interception and restore the original picker after success, timeout or error. A 10-second page timer also restores the shim if normal cleanup cannot run.
 
 Open `chrome://extensions`, find **Universal Browser Bridge**, open **Details**, and enable **Allow access to file URLs**. Reload the updated extension and rebuild/restart the daemon and MCP adapters before using the new tool. Live Chrome uploads are a separate manual check from automated tests.
 
@@ -343,7 +352,7 @@ Both commands use the authenticated daemon control socket, so **serve** must be 
 | `browser_navigate` | Navigate a shared tab to an allowed URL |
 | `browser_click` | Scroll to and click a snapshot element with trusted mouse input (script fallback); consequential approval applies unless the caller's owned tab is trusted |
 | `browser_type` | Replace the contents of a snapshot input element with user activation |
-| `browser_upload_file` | Attach up to 10 allowed local files to a file input in a tab owned by the caller's label |
+| `browser_upload_file` | Attach up to 10 allowed local files through an input or intercepted chooser in a caller-owned tab; modes: auto, input, chooser |
 | `browser_press` | Send trusted keyboard input; Enter and NumpadEnter require approval unless the caller's owned tab is trusted |
 | `browser_scroll` | Scroll a shared page by pixels |
 | `browser_screenshot` | Capture a PNG screenshot of a shared tab |
@@ -556,6 +565,7 @@ Chrome assigns unpacked extensions an identity based partly on their loaded dire
 - Only explicitly shared tabs are attached through `chrome.debugger`.
 - Password input values are omitted from snapshots.
 - File uploads require live ownership by the caller's label, writable/unblocked sites, and user-configured allowed folders; the daemon validates real paths, file types and sizes, and the extension independently guards attachment.
+- Chooser uploads retain those checks and consequential-click approval. The extension rechecks access before each operation, limits interception to one upload per tab, and restores the picker shim and interception after the call. If access is revoked mid-call, cleanup still attempts to disable interception and restore the shim.
 - Navigation and new tabs accept only allowed `http:` and `https:` URLs.
 - Localhost and private-network destinations are blocked unless explicitly enabled.
 - Consequential clicks and Enter presses require Chrome-hosted human approval unless the extension's trust setting is enabled and the live tab belongs to the caller's label.

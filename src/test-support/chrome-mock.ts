@@ -44,6 +44,7 @@ export function createChromeMock(options: { delays?: ChromeMockDelays } = {}) {
   const tabGroupsOnUpdated: Array<(group: MockGroup) => void> = [];
   const actionOnClicked: Array<(tab: MockTab) => Promise<void>> = [];
   const debuggerOnDetach: Array<(source: { tabId: number }, reason: string) => void> = [];
+  const debuggerOnEvent: Array<(source: { tabId: number }, method: string, params: any) => void> = [];
   const actionTitles = new Map<number, string>();
   const commandsOnCommand: Array<(command: string, tab?: MockTab) => void> = [];
   const contextMenusOnClicked: Array<(info: { menuItemId: string }, tab?: MockTab) => void> = [];
@@ -212,7 +213,14 @@ export function createChromeMock(options: { delays?: ChromeMockDelays } = {}) {
         await wait(d("debuggerDetach", 0));
       },
       sendCommand: async (_target: { tabId: number }, _method: string, _params: Record<string, unknown>): Promise<any> => ({}),
-      onDetach: { addListener: (fn: (typeof debuggerOnDetach)[number]) => debuggerOnDetach.push(fn) }
+      onDetach: { addListener: (fn: (typeof debuggerOnDetach)[number]) => debuggerOnDetach.push(fn) },
+      onEvent: {
+        addListener: (fn: (typeof debuggerOnEvent)[number]) => debuggerOnEvent.push(fn),
+        removeListener: (fn: (typeof debuggerOnEvent)[number]) => {
+          const index = debuggerOnEvent.indexOf(fn);
+          if (index >= 0) debuggerOnEvent.splice(index, 1);
+        }
+      }
     },
     action: {
       setBadgeText: async (_details: { tabId?: number; text: string }) => {
@@ -254,8 +262,8 @@ export function createChromeMock(options: { delays?: ChromeMockDelays } = {}) {
   // storage survive. Re-evaluate background.js after this to test restoration.
   function resetWorkerListeners(): void {
     for (const listeners of [tabsOnUpdated, tabsOnRemoved, tabGroupsOnUpdated, actionOnClicked,
-      debuggerOnDetach, commandsOnCommand, contextMenusOnClicked, runtimeOnMessage, storageOnChanged]) listeners.length = 0;
+      debuggerOnDetach, debuggerOnEvent, commandsOnCommand, contextMenusOnClicked, runtimeOnMessage, storageOnChanged]) listeners.length = 0;
   }
 
-  return { chrome, simulateGroupRename, resetWorkerListeners, actionOnClicked, debuggerOnDetach, actionTitles, commandsOnCommand, contextMenusOnClicked, runtimeOnMessage, tabsOnUpdated, tabsById };
+  return { chrome, simulateGroupRename, resetWorkerListeners, actionOnClicked, debuggerOnDetach, debuggerOnEvent, actionTitles, commandsOnCommand, contextMenusOnClicked, runtimeOnMessage, tabsOnUpdated, tabsById };
 }

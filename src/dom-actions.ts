@@ -66,7 +66,7 @@ export function scrollScript(deltaY: number): string {
   return `window.scrollBy({top:${deltaY},behavior:'instant'}); ({x:scrollX,y:scrollY})`;
 }
 
-export function uploadFileScript(ref: string, fileCount: number): string {
+export function uploadFileScript(ref: string, fileCount: number, allowChooser = false): string {
   return `(() => {
     const el = document.querySelector(${JSON.stringify(`[data-ubb-ref="${ref}"]`)});
     if (!el) throw new Error('Element ref expired; take a new snapshot');
@@ -78,7 +78,7 @@ export function uploadFileScript(ref: string, fileCount: number): string {
       const inputs = el.querySelectorAll('input[type="file"]');
       if (inputs.length === 1) input = inputs[0];
     }
-    if (!input) throw new Error('Target is not a file input (or a label/button containing one)');
+    if (!input) ${allowChooser ? "return null;" : "throw new Error('Target is not a file input (or a label/button containing one)');"}
     if (input.disabled || input.matches(':disabled')) throw new Error('File input is disabled');
     if (${fileCount} > 1 && !input.multiple) throw new Error('File input does not allow multiple files');
     return input;

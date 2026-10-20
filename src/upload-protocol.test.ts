@@ -26,6 +26,9 @@ let commands: any[];
 let owned: boolean;
 let liveTab: { id: number; url: string; pendingUrl?: string; active: boolean };
 let evaluation: any;
+let geometry: any;
+let details: any;
+let approved: boolean;
 let uploadError: string | undefined;
 const push = (message: unknown) => extension.emit("message", JSON.stringify(message));
 function authenticate(label?: string) {
@@ -45,9 +48,11 @@ beforeEach(async () => {
   directory = await mkdtemp(join(tmpdir(), "ubb-upload-protocol-"));
   file = join(directory, "ref.png");
   await writeFile(file, "image");
-  commands = []; owned = true; uploadError = undefined;
+  commands = []; owned = true; uploadError = undefined; approved = true;
   liveTab = { id: 7, url: "https://flow.google.com/", active: true };
   evaluation = { result: { objectId: "file-input-object" } };
+  geometry = { result: { value: { x: 60, y: 50, hasSize: true, visible: true, hitTarget: true } } };
+  details = { result: { value: { text: "Upload media" } } };
   bridge = new BrowserBridge("test-token");
   daemon = new DaemonServer(bridge, "test-token", join(directory, "daemon.sock"), new AnnotationStore(join(directory, "annotations")));
   extension = new Peer();
@@ -58,7 +63,12 @@ beforeEach(async () => {
     let result: unknown = {};
     if (message.action === "getTab") result = { ...liveTab };
     if (message.action === "listAgentTabs") result = owned ? [{ tabId: 7, url: liveTab.url, title: "Flow", groupId: 1 }] : [];
-    if (message.method === "Runtime.evaluate") result = evaluation;
+    if (message.action === "requestApproval") result = { approved };
+    if (message.action === "uploadViaFileChooser") result = { uploaded: message.files.length, files: message.files, method: "chooser", picker: "input" };
+    if (message.method === "Runtime.evaluate") {
+      result = message.params.expression.includes("scrollIntoView") ? geometry
+        : message.params.expression.includes("formAction") ? details : evaluation;
+    }
     push({ type: "response", id: message.id, result, error: message.method === "DOM.setFileInputFiles" ? uploadError : undefined });
   };
   (bridge as any).attachExtension(extension);
@@ -76,7 +86,7 @@ afterEach(async () => {
 it("resolves the input then attaches real paths with the objectId without bumping generation", async () => {
   const alias = join(directory, "alias.png");
   await symlink(file, alias);
-  expect(await upload({ files: [alias] })).toMatchObject({ result: { uploaded: 1, files: [await realpath(file)] } });
+  expect(await upload({ files: [alias] })).toMatchObject({ result: { uploaded: 1, files: [await realpath(file)], method: "input", picker: "input" } });
   const cdp = commands.filter((command) => command.action === "cdp");
   expect(commands[0]).toMatchObject({ action: "listAgentTabs", label: "Hephaestus" });
   expect(cdp.map((command) => command.method)).toEqual(["Runtime.evaluate", "DOM.setFileInputFiles"]);
@@ -84,6 +94,60 @@ it("resolves the input then attaches real paths with the objectId without bumpin
   expect(cdp[0].params.expression).toContain("ubb-3");
   expect(cdp[1]).toMatchObject({ tabId: 7, label: "Hephaestus", requiresWritable: true, params: { files: [await realpath(file)], objectId: "file-input-object" } });
   expect((await upload()).error).toBeUndefined();
+});
+
+it("uses one chooser command with real paths and resolved center coords for a non-input ref", async () => {
+  evaluation = { result: { type: "object", subtype: "null", value: null } };
+  const alias = join(directory, "alias.png");
+  await symlink(file, alias);
+  expect(await upload({ files: [alias] })).toMatchObject({ result: { uploaded: 1, files: [await realpath(file)], method: "chooser", picker: "input" } });
+  expect(commands.filter((command) => command.action === "uploadViaFileChooser")).toEqual([
+    expect.objectContaining({ tabId: 7, label: "Hephaestus", files: [await realpath(file)], x: 60, y: 50, timeoutMs: 5000 })
+  ]);
+  expect(commands.some((command) => command.method === "DOM.setFileInputFiles" || command.method?.startsWith("Input."))).toBe(false);
+});
+
+it("forces chooser mode even when an input could resolve and uses A's script fallback for covered targets", async () => {
+  geometry.result.value.hitTarget = false;
+  expect((await upload({ mode: "chooser" })).result.method).toBe("chooser");
+  const chooser = commands.find((command) => command.action === "uploadViaFileChooser");
+  expect(chooser).toMatchObject({ ref: "ubb-3" });
+  expect(chooser.x).toBeUndefined();
+  expect(commands.filter((command) => command.method === "Runtime.evaluate")).toHaveLength(2);
+});
+
+it("keeps the old non-input error in input mode", async () => {
+  evaluation = { exceptionDetails: { exception: { description: "Target is not a file input (or a label/button containing one)" } } };
+  expect((await upload({ mode: "input" })).error).toContain("Target is not a file input");
+  expect(commands.some((command) => command.action === "uploadViaFileChooser")).toBe(false);
+});
+
+it("keeps consequential approval ahead of the chooser command and denial prevents it", async () => {
+  details = { result: { value: { text: "Submit order" } } };
+  approved = false;
+  expect((await upload({ mode: "chooser" })).error).toContain("User denied");
+  expect(commands.some((command) => command.action === "requestApproval")).toBe(true);
+  expect(commands.some((command) => command.action === "uploadViaFileChooser")).toBe(false);
+  expect(commands.some((command) => command.params?.expression?.includes("scrollIntoView"))).toBe(false);
+});
+
+it.each(["unowned", "outside folder", "read-only", "blocked", "stale", "unlabelled"])(
+  "never sends a chooser command when daemon policy rejects %s", async (reason) => {
+    const options: Record<string, unknown> = { mode: "chooser" };
+    if (reason === "unowned") owned = false;
+    if (reason === "outside folder") options.files = [join(tmpdir(), "outside.png")];
+    if (reason === "read-only") liveTab.pendingUrl = "https://hdfcbank.com/";
+    if (reason === "blocked") push({ type: "sitePolicy", blockedDomains: ["flow.google.com"], uploadFolders: [directory] });
+    if (reason === "stale") options.snapshotId = "7:9";
+    if (reason === "unlabelled") { control.destroy(); authenticate(); }
+    expect((await upload(options)).error).toBeDefined();
+    expect(commands.some((command) => command.action === "uploadViaFileChooser" || command.action === "cdp")).toBe(false);
+  }
+);
+
+it("rejects invalid modes before any extension command", async () => {
+  expect((await upload({ mode: "invalid" })).error).toMatch(/mode/i);
+  expect(commands).toEqual([]);
 });
 
 it("rejects unlabelled clients before contacting the extension", async () => {
