@@ -23,6 +23,9 @@
         <label for="blockedDomains">Blocked sites</label>
         <p id="blocklistHelp" class="help">One domain per line. Each domain and its subdomains are blocked from agent access, including hand-shared tabs.</p>
         <textarea id="blockedDomains" rows="5" spellcheck="false" aria-describedby="blocklistHelp" placeholder="example.com&#10;vault.example.org"></textarea>
+        <label for="uploadFolders">Allowed upload folders</label>
+        <p id="uploadFoldersHelp" class="help">One absolute folder per line. Default: /Volumes/NVme/Projects/Stories/. An empty list disables file uploads. Relative paths, NUL characters and .. segments are ignored. Uploads require a tab owned by the calling agent and Chrome's “Allow access to file URLs” setting for this extension.</p>
+        <textarea id="uploadFolders" rows="5" spellcheck="false" aria-describedby="uploadFoldersHelp" placeholder="/Volumes/NVme/Projects/Stories/"></textarea>
         <div class="actions"><button id="savePolicy">Save safety settings</button><span id="policyStatus" role="status"></span></div>
       </section>
       <section>

@@ -223,6 +223,28 @@ Bank, card, payment and password-manager URLs, including the initial URL of a ne
 
 Blocked pages are hidden from tab listings and refuse new tabs, navigation to the domain, snapshots, screenshots, clicks, typing, keys, scrolling and every CDP command. This applies to both owned and hand-shared tabs, regardless of trust. Both the live URL and `pendingUrl` are checked. The extension sends its normalized blocklist over the authenticated connection on connect and on changes; the daemon checks its copy before dispatch and rechecks live tab state through the extension. The extension independently checks again before executing. Refusals contain **"blocked by your blocklist"**. The blocklist controls bridge access to tabs; it does not filter a page's network requests or stop you from opening sites yourself. Previously saved annotations remain available in the local annotation store.
 
+### Uploading files
+
+Use `browser_upload_file` to attach local files to an `<input type="file">`, a label associated with one, or a button/container with exactly one file input. Pass `ref`, `description`, `snapshotId` and `files` (an array of absolute file paths). `tabId` is optional and otherwise uses the selected tab. Take a fresh `browser_snapshot` after navigation.
+
+```json
+{
+  "ref": "ubb-3",
+  "description": "Attach the reference image",
+  "snapshotId": "7:0",
+  "files": ["/Volumes/NVme/Projects/Stories/reference.png"],
+  "tabId": 7
+}
+```
+
+In Extension options, set **Allowed upload folders**, one absolute folder per line, then click **Save safety settings**. The default when unset is `/Volumes/NVme/Projects/Stories/`. An empty list disables uploads. Invalid and relative entries are ignored; saved paths are normalized and duplicates removed. Only extension settings can change this list. An older extension that does not send the setting leaves uploads disabled in the daemon.
+
+Uploads require a labelled agent and a tab owned by that same label. Hand-shared tabs, blocklisted sites, and bank/card/payment/password-manager pages cannot receive files. Disabled file inputs are rejected; attaching multiple files requires the input's `multiple` attribute. Each call accepts 1–10 regular files, each at most 100 MB (104,857,600 bytes).
+
+The daemon resolves files and allowed folders with `realpath` and checks containment, so sibling prefixes and symlinks escaping an allowed folder are rejected. Symlinks pointing into an allowed folder resolve to the real file path, which is passed to Chrome and returned as `{ "uploaded": 1, "files": ["/absolute/real/path"] }`. The extension independently checks these real paths against its configured folder prefixes; when configuring a symlinked folder, also allow its real destination. Paths containing NUL or `..` segments are refused.
+
+Open `chrome://extensions`, find **Universal Browser Bridge**, open **Details**, and enable **Allow access to file URLs**. Reload the updated extension and rebuild/restart the daemon and MCP adapters before using the new tool. Live Chrome uploads are a separate manual check from automated tests.
+
 ## Annotations
 
 Share a normal HTTP(S) tab with the toolbar icon, then enter annotation mode with **Alt+Shift+A** (macOS: **Control+Shift+A**) or right-click the toolbar icon and choose **Annotate this tab**. The toolbar's normal click still toggles sharing. If the shortcut conflicts, change it at `chrome://extensions/shortcuts`.
@@ -321,6 +343,7 @@ Both commands use the authenticated daemon control socket, so **serve** must be 
 | `browser_navigate` | Navigate a shared tab to an allowed URL |
 | `browser_click` | Click a snapshot element, with consequential approval unless the caller's owned tab is trusted |
 | `browser_type` | Replace the contents of a snapshot input element |
+| `browser_upload_file` | Attach up to 10 allowed local files to a file input in a tab owned by the caller's label |
 | `browser_press` | Send a key press; Enter requires approval unless the caller's owned tab is trusted |
 | `browser_scroll` | Scroll a shared page by pixels |
 | `browser_screenshot` | Capture a PNG screenshot of a shared tab |
@@ -530,6 +553,7 @@ Chrome assigns unpacked extensions an identity based partly on their loaded dire
 - The local control socket is owner-only and also token-authenticated.
 - Only explicitly shared tabs are attached through `chrome.debugger`.
 - Password input values are omitted from snapshots.
+- File uploads require live ownership by the caller's label, writable/unblocked sites, and user-configured allowed folders; the daemon validates real paths, file types and sizes, and the extension independently guards attachment.
 - Navigation and new tabs accept only allowed `http:` and `https:` URLs.
 - Localhost and private-network destinations are blocked unless explicitly enabled.
 - Consequential clicks and Enter presses require Chrome-hosted human approval unless the extension's trust setting is enabled and the live tab belongs to the caller's label.

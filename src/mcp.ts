@@ -118,6 +118,20 @@ export async function runMcpServer(bridge: DaemonClient, transport: Transport = 
   );
 
   server.tool(
+    "browser_upload_file",
+    "Attach local files to a file input in a tab owned by your agent label. The target can be an <input type=file> or a label/button wrapping one. Files must be inside a folder the user allowed in Extension options. Never available in hand-shared tabs, blocklisted sites, or bank/card/payment/password-manager pages. Requires the ref and snapshotId from browser_snapshot.",
+    {
+      ref: z.string().regex(/^ubb-\d+$/),
+      description: z.string().min(1),
+      snapshotId: z.string().min(1),
+      files: z.array(z.string()).min(1).max(10),
+      tabId: z.number().int().optional()
+    },
+    async ({ ref, description, snapshotId, files, tabId }) =>
+      text(await bridge.request({ action: "uploadFile", tabId: await selectedTab(bridge, tabId), ref, description, snapshotId, files }))
+  );
+
+  server.tool(
     "browser_press",
     "Press a keyboard key in a shared tab. Enter can submit forms, so it requires explicit user confirmation; the daemon decides and enforces this, not the calling adapter.",
     {

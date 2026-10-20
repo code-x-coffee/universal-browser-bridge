@@ -15,8 +15,8 @@ export type SharedTab = {
 export type AgentTab = { tabId: number; url: string; title: string; groupId: number };
 
 export type ExtensionMessage =
-  | { type: "hello"; token: string; version: number; blockedDomains?: string[] }
-  | { type: "sitePolicy"; blockedDomains: string[] }
+  | { type: "hello"; token: string; version: number; blockedDomains?: string[]; uploadFolders?: string[] }
+  | { type: "sitePolicy"; blockedDomains: string[]; uploadFolders?: string[] }
   | { type: "tabs"; tabs: SharedTab[] }
   | { type: "response"; id: string; result?: unknown; error?: string }
   | { type: "event"; tabId: number; method: string; params: unknown }
@@ -66,6 +66,7 @@ export type ControlAction =
   | "snapshot"
   | "click"
   | "type"
+  | "uploadFile"
   | "navigate"
   | "press"
   | "scroll"
@@ -88,6 +89,7 @@ export type ControlClientMessage =
       description?: string;
       ref?: string;
       text?: string;
+      files?: string[];
       snapshotId?: string;
       key?: string;
       deltaY?: number;

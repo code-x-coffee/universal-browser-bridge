@@ -7,9 +7,10 @@ import { AnnotationStore } from "./annotations.js";
 import { AnnotationWebhook } from "./annotation-webhook.js";
 import { isPotentiallyConsequential } from "./policy.js";
 import { PROTOCOL_VERSION, type AnnotationExtensionRequest, type ControlClientMessage, type ControlServerMessage, type SharedTab } from "./protocol.js";
-import { clickDetailsScript, clickScript, describeKey, scrollScript, snapshotScript, typeScript } from "./dom-actions.js";
+import { clickDetailsScript, clickScript, describeKey, scrollScript, snapshotScript, typeScript, uploadFileScript } from "./dom-actions.js";
 import { TabLeaseManager } from "./tab-lease.js";
 import { assertBrowserUrlAllowed, isReadOnlyBrowserUrl, assertTabNotBlocked, isBlockedBrowserUrl } from "./url-policy.js";
+import { validateUploadFiles } from "./upload-policy.js";
 
 type ControlRequest = Extract<ControlClientMessage, { type: "request" }>;
 
@@ -369,6 +370,36 @@ export class DaemonServer {
         await this.assertWritableTab(tabId, label);
         this.assertGenerationCurrent(tabId, message.snapshotId);
         return evaluate(this.bridge, tabId, label, typeScript(message.ref ?? "", message.text ?? ""), true);
+      });
+    }
+
+    if (action === "uploadFile") {
+      return this.leases.runExclusive(tabId, async () => {
+        if (typeof label !== "string" || !label.trim()) throw new Error("An agent label is required for file uploads");
+        const ownedTabs = await this.bridge.command({ action: "listAgentTabs", label });
+        if (!Array.isArray(ownedTabs) || !ownedTabs.some((tab) => tab.tabId === tabId)) {
+          throw new Error("File uploads require a tab owned by your agent label; hand-shared and other-label tabs cannot upload files");
+        }
+        await this.assertWritableTab(tabId, label);
+        this.assertGenerationCurrent(tabId, message.snapshotId);
+        const realPaths = await validateUploadFiles(message.files, this.bridge.uploadFolders);
+        const target = await cdp(this.bridge, tabId, label, "Runtime.evaluate", {
+          expression: uploadFileScript(message.ref ?? "", realPaths.length), returnByValue: false
+        }, true);
+        if (target?.exceptionDetails) {
+          throw new Error(target.exceptionDetails.exception?.description ?? target.exceptionDetails.text ?? "Page script failed");
+        }
+        const objectId = target?.result?.objectId;
+        if (typeof objectId !== "string" || !objectId) throw new Error("Chrome did not return a file input objectId");
+        try {
+          await cdp(this.bridge, tabId, label, "DOM.setFileInputFiles", { files: realPaths, objectId }, true);
+        } catch (error) {
+          if (/not allowed/i.test((error as Error).message)) {
+            throw new Error(`${(error as Error).message}. Enable "Allow access to file URLs" for Universal Browser Bridge in chrome://extensions`);
+          }
+          throw error;
+        }
+        return { uploaded: realPaths.length, files: realPaths };
       });
     }
 

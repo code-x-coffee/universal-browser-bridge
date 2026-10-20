@@ -47,6 +47,10 @@ async function create(label?: string, url = "https://example.com/") {
   return response.result;
 }
 
+async function upload(tabId: number, label: string | undefined, files: unknown = ["/Volumes/NVme/Projects/Stories/ref.png"]) {
+  return command({ action: "cdp", tabId, label, method: "DOM.setFileInputFiles", params: { files, objectId: "file-input" } });
+}
+
 beforeEach(async () => {
   vi.useFakeTimers();
   mock = createChromeMock();
@@ -59,6 +63,64 @@ beforeEach(async () => {
 });
 afterEach(() => {
   vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks();
+});
+
+it("sends upload folders in hello and sitePolicy and resends storage changes", async () => {
+  expect(FakeSocket.instance.messages.find((message) => message.type === "hello").uploadFolders)
+    .toEqual(["/Volumes/NVme/Projects/Stories/"]);
+  expect(FakeSocket.instance.messages.find((message) => message.type === "sitePolicy").uploadFolders)
+    .toEqual(["/Volumes/NVme/Projects/Stories/"]);
+  await mock.chrome.storage.local.set({ uploadFolders: [" /tmp/images ", "relative", "/x/../y"] });
+  await settle();
+  expect(FakeSocket.instance.messages.filter((message) => message.type === "sitePolicy").at(-1).uploadFolders)
+    .toEqual(["/tmp/images/"]);
+  await mock.chrome.storage.local.set({ uploadFolders: [] });
+  await settle();
+  expect(FakeSocket.instance.messages.filter((message) => message.type === "sitePolicy").at(-1).uploadFolders).toEqual([]);
+});
+
+it("allows file attachment only to tabs owned by the supplied label", async () => {
+  const owned = await create("Hephaestus");
+  const shared = await create();
+  const send = vi.spyOn(mock.chrome.debugger, "sendCommand");
+  expect((await upload(shared.id, "Hephaestus")).error).toMatch(/owned.*label/i);
+  expect((await upload(shared.id, undefined)).error).toMatch(/label/i);
+  expect((await upload(owned.id, "Hermes")).error).toMatch(/owned/i);
+  expect(send).not.toHaveBeenCalled();
+  expect((await upload(owned.id, "Hephaestus")).error).toBeUndefined();
+  expect(send).toHaveBeenCalledWith({ tabId: owned.id }, "DOM.setFileInputFiles", expect.objectContaining({ objectId: "file-input" }));
+});
+
+it("rejects file paths outside the extension folders including sibling prefixes and traversal", async () => {
+  const tab = await create("Hephaestus");
+  const send = vi.spyOn(mock.chrome.debugger, "sendCommand");
+  for (const path of ["/etc/passwd", "/Volumes/NVme/Projects/Stories-evil/file", "/Volumes/NVme/Projects/Stories/../secret", "/Volumes/NVme/Projects/Stories/a\0b", "relative"]) {
+    expect((await upload(tab.id, "Hephaestus", [path])).error).toMatch(/allowed upload folders/i);
+  }
+  await mock.chrome.storage.local.set({ uploadFolders: [] });
+  expect((await upload(tab.id, "Hephaestus")).error).toMatch(/disabled/i);
+  expect(send).not.toHaveBeenCalled();
+});
+
+it("requires file URL permission when Chrome exposes the permission check", async () => {
+  const tab = await create("Hephaestus");
+  Object.assign(mock.chrome, { extension: { isAllowedFileSchemeAccess: async () => false } });
+  const send = vi.spyOn(mock.chrome.debugger, "sendCommand");
+  expect((await upload(tab.id, "Hephaestus")).error).toContain("Allow access to file URLs");
+  expect(send).not.toHaveBeenCalled();
+  Object.assign(mock.chrome, { extension: { isAllowedFileSchemeAccess: async () => true } });
+  expect((await upload(tab.id, "Hephaestus")).error).toBeUndefined();
+});
+
+it("enforces writable and blocklist policy on file attachment even without requiresWritable", async () => {
+  const tab = await create("Hephaestus");
+  const send = vi.spyOn(mock.chrome.debugger, "sendCommand");
+  mock.tabsById.get(tab.id)!.url = "https://hdfcbank.com/";
+  expect((await upload(tab.id, "Hephaestus")).error).toMatch(/read-only/);
+  mock.tabsById.get(tab.id)!.url = "https://example.com/";
+  await mock.chrome.storage.local.set({ blockedDomains: ["example.com"] });
+  expect((await upload(tab.id, "Hephaestus")).error).toMatch(/blocked by your blocklist/);
+  expect(send).not.toHaveBeenCalled();
 });
 
 it("creates tabs in a group titled with the exact label and reuses it within the window", async () => {
