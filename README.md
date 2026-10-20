@@ -341,10 +341,10 @@ Both commands use the authenticated daemon control socket, so **serve** must be 
 | `browser_close_tab` | Close a caller-owned tab or a tab otherwise legitimately shared with the caller |
 | `browser_snapshot` | Read compact interactive elements and receive a `snapshotId` |
 | `browser_navigate` | Navigate a shared tab to an allowed URL |
-| `browser_click` | Click a snapshot element, with consequential approval unless the caller's owned tab is trusted |
-| `browser_type` | Replace the contents of a snapshot input element |
+| `browser_click` | Scroll to and click a snapshot element with trusted mouse input (script fallback); consequential approval applies unless the caller's owned tab is trusted |
+| `browser_type` | Replace the contents of a snapshot input element with user activation |
 | `browser_upload_file` | Attach up to 10 allowed local files to a file input in a tab owned by the caller's label |
-| `browser_press` | Send a key press; Enter requires approval unless the caller's owned tab is trusted |
+| `browser_press` | Send trusted keyboard input; Enter and NumpadEnter require approval unless the caller's owned tab is trusted |
 | `browser_scroll` | Scroll a shared page by pixels |
 | `browser_screenshot` | Capture a PNG screenshot of a shared tab |
 | `annotations_list` | List saved annotations by exact URL and status |
@@ -353,6 +353,8 @@ Both commands use the authenticated daemon control socket, so **serve** must be 
 | `annotations_reply` | Append a reply and update live pins, including on resolved annotations |
 
 `browser_click` and `browser_type` require both the element `ref` and `snapshotId` returned by `browser_snapshot`. Take another snapshot after navigating.
+
+`browser_click` scrolls the element into view and checks its center with `document.elementFromPoint`. When the center is visible, has size and hits the element or a descendant, it sends trusted CDP mouse move, left-button press and release events. Zero-size, covered or offscreen targets use a script click with `userGesture: true` instead. The result is `{ clicked: true, method: "mouse" | "script" }`. The fallback click event remains synthetic, but the script runs with user activation for actions such as downloads and file pickers. `browser_type` also runs its focus/value script with user activation. `browser_press` uses trusted CDP key events and retains approval for Enter and NumpadEnter.
 
 ## Running automatically
 
@@ -559,6 +561,7 @@ Chrome assigns unpacked extensions an identity based partly on their loaded dire
 - Consequential clicks and Enter presses require Chrome-hosted human approval unless the extension's trust setting is enabled and the live tab belongs to the caller's label.
 - Creating the agent window requires approval only when **Let agents open their window without asking** is turned off. It is enabled by default, so any local process holding the bridge token can open agent tabs in the signed-in Chrome without a prompt.
 - Bank, card, payment and password-manager pages always remain read-only, regardless of either trust or automatic window creation settings.
+- The daemon rechecks writable policy before CDP calls marked `requiresWritable`. The extension independently treats every `Input.*` method and `DOM.setFileInputFiles` as a write, even if the caller omits that flag. Trusted input and script user activation retain tab ownership, blocklist, snapshot and approval checks.
 - Blocklisted domains and their subdomains refuse all page operations in owned and hand-shared tabs, with current and pending URL checks in both the daemon and extension.
 - The model cannot approve its own request.
 - Agent-created tabs belong to their creating adapter while it is connected.

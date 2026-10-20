@@ -37,6 +37,23 @@ export function clickDetailsScript(ref: string): string {
   return `(() => { const el = document.querySelector('[data-ubb-ref="${ref}"]'); if (!el) throw new Error('Element ref expired; take a new snapshot'); return { text: (el.innerText || el.getAttribute('aria-label') || el.value || '').trim().slice(0, 300), type: el.getAttribute('type'), href: el.href || '', formAction: el.formAction || '' }; })()`;
 }
 
+export function clickTargetScript(ref: string): string {
+  return `(() => {
+    const el = document.querySelector(${JSON.stringify(`[data-ubb-ref="${ref}"]`)});
+    if (!el) throw new Error('Element ref expired; take a new snapshot');
+    el.scrollIntoView({block:'center', inline:'center'});
+    const rect = el.getBoundingClientRect();
+    const x = rect.x + rect.width / 2;
+    const y = rect.y + rect.height / 2;
+    const style = getComputedStyle(el);
+    const hasSize = rect.width > 0 && rect.height > 0;
+    const visible = style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse'
+      && x >= 0 && y >= 0 && x < innerWidth && y < innerHeight;
+    const hit = document.elementFromPoint(x, y);
+    return { x, y, hasSize, visible, hitTarget: hit === el || (hit !== null && el.contains(hit)) };
+  })()`;
+}
+
 export function clickScript(ref: string): string {
   return `(() => { const el = document.querySelector('[data-ubb-ref="${ref}"]'); if (!el) throw new Error('Element ref expired; take a new snapshot'); el.click(); return true; })()`;
 }

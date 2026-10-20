@@ -123,6 +123,31 @@ it("enforces writable and blocklist policy on file attachment even without requi
   expect(send).not.toHaveBeenCalled();
 });
 
+it.each(["url", "pendingUrl"] as const)("enforces read-only live %s on every Input method without a writable flag", async (field) => {
+  const tab = await create("Hephaestus");
+  const send = vi.spyOn(mock.chrome.debugger, "sendCommand");
+  mock.tabsById.get(tab.id)![field] = "https://hdfcbank.com/";
+  for (const method of ["Input.dispatchMouseEvent", "Input.dispatchKeyEvent", "Input.insertText", "Input.dispatchTouchEvent"]) {
+    for (const requiresWritable of [undefined, false]) {
+      expect((await command({ action: "cdp", tabId: tab.id, label: "Hephaestus", method, requiresWritable })).error).toMatch(/read-only/);
+    }
+  }
+  expect(send).not.toHaveBeenCalled();
+});
+
+it("forwards mouse input on writable tabs while retaining ownership and blocklist checks", async () => {
+  const tab = await create("Hephaestus");
+  const send = vi.spyOn(mock.chrome.debugger, "sendCommand");
+  const input = { action: "cdp", tabId: tab.id, method: "Input.dispatchMouseEvent", params: { type: "mousePressed", x: 60, y: 50, button: "left", clickCount: 1 } };
+  expect((await command({ ...input, label: "Hermes" })).error).toMatch(/owned/i);
+  await mock.chrome.storage.local.set({ blockedDomains: ["example.com"] });
+  expect((await command({ ...input, label: "Hephaestus" })).error).toContain("blocked by your blocklist");
+  expect(send).not.toHaveBeenCalled();
+  await mock.chrome.storage.local.set({ blockedDomains: [] });
+  expect((await command({ ...input, label: "Hephaestus" })).error).toBeUndefined();
+  expect(send).toHaveBeenCalledWith({ tabId: tab.id }, "Input.dispatchMouseEvent", input.params);
+});
+
 it("creates tabs in a group titled with the exact label and reuses it within the window", async () => {
   const first = await create("Hephaestus");
   const second = await create("Hephaestus", "https://example.com/second");
